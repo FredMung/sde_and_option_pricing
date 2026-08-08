@@ -48,18 +48,12 @@ def price_put(
     )
 
     if exercise_style is ExerciseStyle.EUROPEAN:
-        # Resetting the seed makes calculate_option_price use the displayed paths.
-        if config.seed is not None:
-            np.random.seed(config.seed)
-        price, standard_error = simulator.calculate_option_price(
-            market.spot,
-            contract.maturity,
-            market.risk_free_rate,
-            market.volatility,
-            contract.strike,
-            config.n_paths,
-            config.n_steps,
+        pathwise_values = np.exp(-market.risk_free_rate * contract.maturity) * np.maximum(
+            contract.strike - paths[-1], 0.0
         )
+        price = float(np.mean(pathwise_values))
+        standard_error = float(np.std(pathwise_values) / np.sqrt(config.n_paths))
+        exercise_percentages = None
         method = "Terminal-payoff Monte Carlo"
     elif exercise_style is ExerciseStyle.AMERICAN:
         lsmc = LSMCPriceSimulator(simulator)
@@ -69,6 +63,11 @@ def price_put(
             market.risk_free_rate,
             contract.maturity / config.n_steps,
         )
+        pathwise_values = lsmc.option_value_paths[0].copy()
+        exercise_counts = np.bincount(
+            lsmc.exercise_steps[lsmc.exercise_steps >= 0], minlength=config.n_steps + 1
+        )
+        exercise_percentages = 100.0 * exercise_counts / config.n_paths
         method = "Least-squares Monte Carlo"
     else:
         raise ValueError(f"Unsupported exercise style: {exercise_style}")
@@ -77,6 +76,9 @@ def price_put(
     high = price + 1.96 * standard_error
     shown = min(config.max_display_paths, config.n_paths)
     terminal_prices = paths[-1].copy()
+    path_counts, estimates, convergence_low, convergence_high = _convergence_trace(
+        pathwise_values
+    )
     return PricingResult(
         price=price,
         standard_error=standard_error,
@@ -88,4 +90,23 @@ def price_put(
         exercise_style=exercise_style,
         model_name=model,
         pricing_method=method,
+        convergence_path_counts=path_counts,
+        convergence_estimates=estimates,
+        convergence_lower=convergence_low,
+        convergence_upper=convergence_high,
+        exercise_percentages=exercise_percentages,
     )
+
+
+def _convergence_trace(
+    pathwise_values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return cumulative estimates and normal-approximation Monte Carlo intervals."""
+    counts = np.arange(1, pathwise_values.size + 1)
+    cumulative_sum = np.cumsum(pathwise_values, dtype=float)
+    estimates = cumulative_sum / counts
+    second_moments = np.cumsum(np.square(pathwise_values), dtype=float) / counts
+    variances = np.maximum(second_moments - np.square(estimates), 0.0)
+    standard_errors = np.sqrt(variances / counts)
+    margin = 1.96 * standard_errors
+    return counts, estimates, np.maximum(0.0, estimates - margin), estimates + margin

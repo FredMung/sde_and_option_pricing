@@ -72,3 +72,72 @@ def payoff_figure(result: PricingResult, contract: PutContract) -> go.Figure:
         height=410,
     )
     return figure
+
+
+def convergence_figure(result: PricingResult) -> go.Figure:
+    """Plot the cumulative Monte Carlo estimate and its approximate 95% interval."""
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=result.convergence_path_counts,
+            y=result.convergence_upper,
+            mode="lines",
+            line={"width": 0},
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=result.convergence_path_counts,
+            y=result.convergence_lower,
+            mode="lines",
+            line={"width": 0},
+            fill="tonexty",
+            fillcolor="rgba(36, 91, 130, 0.18)",
+            name="Approximate 95% interval",
+            hovertemplate="Paths=%{x:,}<br>Lower=%{y:.4f}<extra></extra>",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=result.convergence_path_counts,
+            y=result.convergence_estimates,
+            mode="lines",
+            line={"width": 2, "color": "#245b82"},
+            name="Cumulative estimate",
+            hovertemplate="Paths=%{x:,}<br>Estimate=%{y:.4f}<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        title="Monte Carlo convergence by simulated path",
+        xaxis_title="Number of paths included",
+        yaxis_title="Estimated option value",
+        template="plotly_white",
+        height=430,
+        hovermode="x unified",
+    )
+    return figure
+
+
+def exercise_figure(result: PricingResult) -> go.Figure:
+    """Plot the share of all paths whose selected stopping time is each step."""
+    if result.exercise_percentages is None:
+        raise ValueError("Exercise frequencies are only available for American options")
+    figure = go.Figure(
+        go.Bar(
+            x=np.arange(result.exercise_percentages.size),
+            y=result.exercise_percentages,
+            marker_color="#245b82",
+            hovertemplate="Step=%{x}<br>Paths exercised=%{y:.2f}%<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        title="LSMC stopping policy by exercise step",
+        xaxis_title="Exercise step (final step is maturity)",
+        yaxis_title="Percentage of all paths",
+        yaxis={"ticksuffix": "%"},
+        template="plotly_white",
+        height=430,
+    )
+    return figure

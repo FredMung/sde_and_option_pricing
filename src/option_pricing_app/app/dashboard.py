@@ -6,7 +6,13 @@ from datetime import UTC, date, datetime
 import pandas as pd
 import streamlit as st
 
-from option_pricing_app.app.charts import paths_figure, payoff_figure, terminal_figure
+from option_pricing_app.app.charts import (
+    convergence_figure,
+    exercise_figure,
+    paths_figure,
+    payoff_figure,
+    terminal_figure,
+)
 from option_pricing_app.domain import (
     ExerciseStyle,
     MarketInputs,
@@ -298,6 +304,17 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
     columns[1].metric("Monte Carlo standard error", f"{result.standard_error:,.4f}")
     low, high = result.confidence_interval
     columns[2].metric("Approximate 95% interval", f"[{low:,.4f}, {high:,.4f}]")
+    st.plotly_chart(convergence_figure(result), use_container_width=True)
+    st.caption(
+        "The line is the cumulative mean of discounted pathwise payoffs; the band is "
+        "the approximate 95% Monte Carlo confidence interval at each path count."
+    )
+    if result.exercise_percentages is not None:
+        st.plotly_chart(exercise_figure(result), use_container_width=True)
+        st.caption(
+            "Each path is counted once at its final LSMC stopping time. Paths that "
+            "expire out of the money are not counted as exercised."
+        )
     st.plotly_chart(paths_figure(result), use_container_width=True)
     left, right = st.columns(2)
     left.plotly_chart(terminal_figure(result, inputs.contract), use_container_width=True)

@@ -36,14 +36,35 @@ def test_service_prices_both_exercise_styles(style):
     assert result.confidence_interval[0] >= 0
     assert result.displayed_paths.shape == (26, 20)
     assert result.terminal_prices.shape == (1_000,)
+    assert result.convergence_path_counts.shape == (1_000,)
+    assert result.convergence_estimates[-1] == pytest.approx(result.price)
+    assert result.convergence_lower[-1] == pytest.approx(result.confidence_interval[0])
+    assert result.convergence_upper[-1] == pytest.approx(result.confidence_interval[1])
+    if style is ExerciseStyle.AMERICAN:
+        assert result.exercise_percentages.shape == (26,)
+        assert 0 <= result.exercise_percentages.sum() <= 100
+    else:
+        assert result.exercise_percentages is None
 
 
 def test_lsmc_handles_no_in_the_money_paths():
     paths = np.full((4, 10), 120.0)
     paths[0] = 100.0
-    price, error = LSMCPriceSimulator().backward_induction(paths, 90, 0.05, 1 / 3)
+    simulator = LSMCPriceSimulator()
+    price, error = simulator.backward_induction(paths, 90, 0.05, 1 / 3)
     assert price == 0
     assert error == 0
+    assert np.all(simulator.exercise_steps == -1)
+
+
+def test_unseeded_european_trace_matches_displayed_simulation_price():
+    result = price_put(
+        PutContract(100, 1),
+        MarketInputs(100, 0.2, 0.05),
+        SimulationConfig(500, 10, None, 10),
+        ExerciseStyle.EUROPEAN,
+    )
+    assert result.convergence_estimates[-1] == pytest.approx(result.price)
 
 
 @pytest.mark.parametrize(

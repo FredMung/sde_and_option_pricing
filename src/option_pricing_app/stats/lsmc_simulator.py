@@ -11,6 +11,7 @@ class LSMCPriceSimulator:
         # Use composition so that GBM can later be replaced by another path model.
         self.price_path_simulator = price_path_simulator or GBMPriceSimulator()
         self.option_value_paths = None
+        self.exercise_steps = None
 
     def generate_price_paths(self, S0, T, r, sigma, n_paths, n_steps):
         """Generate paths on the exercise-time grid used by LSMC."""
@@ -61,6 +62,9 @@ class LSMCPriceSimulator:
         
         # Calculate the terminal option payoff max(K-S_T,0) for each path at at maturity (time T)
         cash_flows = self.calculate_payoff(price_paths[-1], K)
+        # -1 denotes expiry with no payoff. A maturity payoff is exercise at the
+        # final step unless an earlier stopping decision subsequently replaces it.
+        exercise_steps = np.where(cash_flows > 0, n_time_points - 1, -1)
         option_value_paths = np.empty_like(price_paths)
         option_value_paths[-1, :] = cash_flows
         
@@ -95,6 +99,7 @@ class LSMCPriceSimulator:
             # Move future cash flows from t+1 to t by discounting once, then replace exercised paths.
             cash_flows = discount_factor * cash_flows
             cash_flows[exercise_decision] = immediate_exercise_value[exercise_decision]
+            exercise_steps[exercise_decision] = t
             option_value_paths[t, :] = cash_flows
         
         # Move the time-1 cash flows to time zero.
@@ -104,13 +109,15 @@ class LSMCPriceSimulator:
 
         # Exercise immediately if in-the-money already at time 0
         immediate_exercise_at_zero = self.calculate_payoff(price_paths[0, 0], K)
-        if immediate_exercise_at_zero >= continuation_value_at_zero:
+        if immediate_exercise_at_zero > 0 and immediate_exercise_at_zero >= continuation_value_at_zero:
             option_value_paths[0, :] = immediate_exercise_at_zero
             self.option_value_paths = option_value_paths
+            self.exercise_steps = np.zeros(n_paths, dtype=int)
             return float(immediate_exercise_at_zero), 0.0
 
         option_value_paths[0, :] = discounted_cash_flows
         self.option_value_paths = option_value_paths
+        self.exercise_steps = exercise_steps
         standard_error = np.std(discounted_cash_flows) / np.sqrt(n_paths)
         return float(continuation_value_at_zero), float(standard_error)
     

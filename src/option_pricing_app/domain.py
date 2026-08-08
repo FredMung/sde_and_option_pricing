@@ -70,6 +70,11 @@ class PricingResult:
     exercise_style: ExerciseStyle
     model_name: str
     pricing_method: str
+    convergence_path_counts: np.ndarray
+    convergence_estimates: np.ndarray
+    convergence_lower: np.ndarray
+    convergence_upper: np.ndarray
+    exercise_percentages: np.ndarray | None
 
 
 def _positive(name: str, value: float) -> None:
