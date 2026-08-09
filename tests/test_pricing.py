@@ -36,7 +36,14 @@ def test_service_prices_both_exercise_styles(style):
     assert result.standard_error >= 0
     assert result.confidence_interval[0] >= 0
     assert result.displayed_paths.shape == (26, 20)
+    assert result.path_quantile_05.shape == (26,)
+    assert result.path_quantile_95.shape == (26,)
+    assert result.risk_neutral_expected_path.shape == (26,)
+    assert np.all(result.path_quantile_05 <= result.path_quantile_95)
+    assert result.risk_neutral_expected_path[-1] == pytest.approx(100 * np.exp(0.05))
     assert result.terminal_prices.shape == (1_000,)
+    assert result.discounted_realised_cash_flows.shape == (1_000,)
+    assert np.mean(result.discounted_realised_cash_flows) == pytest.approx(result.price)
     assert result.european_mc_price >= 0
     assert result.european_exact_price == pytest.approx(5.573526, abs=1e-6)
     assert result.convergence_path_counts.shape == (1_000,)
@@ -85,7 +92,7 @@ def test_black_scholes_put_matches_known_value():
         lambda: MarketInputs(0, 0.2, 0.05),
         lambda: MarketInputs(100, 0, 0.05),
         lambda: SimulationConfig(99, 100),
-        lambda: SimulationConfig(1_000, 501),
+        lambda: SimulationConfig(1_000, 1_001),
     ],
 )
 def test_invalid_inputs_are_rejected(factory):

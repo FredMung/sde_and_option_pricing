@@ -36,7 +36,7 @@ class MarketInputs:
 
 @dataclass(frozen=True)
 class SimulationConfig:
-    n_paths: int = 5_000
+    n_paths: int = 1_000
     n_steps: int = 100
     seed: int | None = 42
     max_display_paths: int = 100
@@ -48,8 +48,8 @@ class SimulationConfig:
             raise TypeError("n_steps must be an integer")
         if not 100 <= self.n_paths <= 25_000:
             raise ValueError("n_paths must be between 100 and 25,000")
-        if not 1 <= self.n_steps <= 500:
-            raise ValueError("n_steps must be between 1 and 500")
+        if not 1 <= self.n_steps <= 1_000:
+            raise ValueError("n_steps must be between 1 and 1,000")
         if self.seed is not None and (
             isinstance(self.seed, bool) or not isinstance(self.seed, int) or self.seed < 0
         ):
@@ -65,8 +65,12 @@ class PricingResult:
     confidence_interval: tuple[float, float]
     time_grid: np.ndarray
     displayed_paths: np.ndarray
+    path_quantile_05: np.ndarray
+    path_quantile_95: np.ndarray
+    risk_neutral_expected_path: np.ndarray
     terminal_prices: np.ndarray
     terminal_payoffs: np.ndarray
+    discounted_realised_cash_flows: np.ndarray
     exercise_style: ExerciseStyle
     model_name: str
     pricing_method: str

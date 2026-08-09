@@ -83,6 +83,8 @@ def price_put(
     high = price + 1.96 * standard_error
     shown = min(config.max_display_paths, config.n_paths)
     terminal_prices = paths[-1].copy()
+    time_grid = np.linspace(0.0, contract.maturity, config.n_steps + 1)
+    path_quantile_05, path_quantile_95 = np.quantile(paths, [0.05, 0.95], axis=1)
     path_counts, estimates, convergence_low, convergence_high = _convergence_trace(
         pathwise_values
     )
@@ -90,10 +92,14 @@ def price_put(
         price=price,
         standard_error=standard_error,
         confidence_interval=(low, high),
-        time_grid=np.linspace(0.0, contract.maturity, config.n_steps + 1),
+        time_grid=time_grid,
         displayed_paths=paths[:, :shown].copy(),
+        path_quantile_05=path_quantile_05,
+        path_quantile_95=path_quantile_95,
+        risk_neutral_expected_path=market.spot * np.exp(market.risk_free_rate * time_grid),
         terminal_prices=terminal_prices,
         terminal_payoffs=np.maximum(contract.strike - terminal_prices, 0.0),
+        discounted_realised_cash_flows=pathwise_values.copy(),
         exercise_style=exercise_style,
         model_name=model,
         pricing_method=method,

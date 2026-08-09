@@ -8,7 +8,7 @@
 This standalone portfolio application migrates the statistical understanding from
 the dissertation project into an interactive presentation. The GBM and LSMC
 pricing algorithms are intentionally kept aligned with the dissertation versions;
-application-specific validation, market data, and visualization live outside them.
+application-specific validation, market data, and visualisation live outside them.
 
 ## What the application demonstrates
 
@@ -36,7 +36,7 @@ src/option_pricing_app/
 tests/                            # Numerical, data-adapter, and app tests
 ```
 
-Visualizations sit on the app side. The statistical modules do not know about
+Visualisations sit on the app side. The statistical modules do not know about
 Streamlit or Plotly, which keeps the mathematical work reusable.
 
 ## Run locally
@@ -56,12 +56,12 @@ poetry run pytest
 poetry run ruff check .
 ```
 
-## Inputs and data behavior
+## Inputs and data behaviour
 
 The dashboard is put-only and single-asset. Manual spot or manual maturity switches
 all market assumptions to manual entry. With a live ticker and listed expiry, strike,
 volatility, and interest-rate sources can be selected independently. Historical
-volatility uses one year of daily log returns and an annualization factor of
+volatility uses one year of daily log returns and an annualisation factor of
 `sqrt(252)`. A manual strike with implied volatility uses the nearest listed put
 contract and identifies the approximation.
 

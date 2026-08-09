@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from option_pricing_app.app.charts import (
+    cash_flow_figure,
     convergence_figure,
     exercise_figure,
     paths_figure,
@@ -116,11 +117,16 @@ def _controls() -> DashboardInputs | None:
 
     model = sidebar.selectbox("Asset-price model", ["GBM"])
     exercise_style = ExerciseStyle(
-        sidebar.selectbox("Exercise style", [style.value for style in ExerciseStyle])
+        sidebar.selectbox(
+            "Exercise style",
+            [style.value for style in ExerciseStyle],
+            index=1,
+        )
     )
     spot_source = sidebar.radio(
         "Initial price source",
         ["Manual price", "Live ticker"],
+        index=1,
         key="spot_source",
         help="Manual spot or manual maturity switches all market inputs to manual mode.",
     )
@@ -204,9 +210,9 @@ def _controls() -> DashboardInputs | None:
     sidebar.divider()
     sidebar.subheader("Simulation")
     n_paths = int(
-        sidebar.number_input("Number of paths", 100, 25_000, 5_000, step=500)
+        sidebar.number_input("Number of paths", 100, 25_000, 1_000, step=500)
     )
-    n_steps = int(sidebar.number_input("Number of time steps", 1, 500, 100, step=10))
+    n_steps = int(sidebar.number_input("Number of time steps", 1, 1_000, 100, step=10))
     with sidebar.expander("Advanced settings"):
         fixed_seed = st.checkbox("Use a reproducible random seed", value=True)
         seed = int(st.number_input("Random seed", 0, value=42)) if fixed_seed else None
@@ -296,6 +302,8 @@ def _manual_defaults(manual: bool, quote, expiry, chain) -> None:
             manual_spot=float(spot),
             manual_maturity=float(_maturity(expiry) if expiry and expiry != MANUAL_MATURITY else 1.0),
             manual_strike=float(spot),
+            manual_volatility=20.0,
+            manual_rate=4.0,
         )
     st.session_state.setdefault("manual_spot", 100.0)
     st.session_state.setdefault("manual_maturity", 1.0)
@@ -319,12 +327,43 @@ def _maturity(expiry: str) -> float:
 def _results(result: PricingResult, inputs: DashboardInputs) -> None:
     st.subheader("Simulation results")
     st.caption("Results reflect the inputs captured when Generate simulation was pressed.")
-    columns = st.columns(3)
-    columns[0].metric("Estimated put value", f"{result.price:,.4f}")
-    columns[1].metric("Monte Carlo standard error", f"{result.standard_error:,.4f}")
+    core_columns = st.columns(3)
+    core_columns[0].metric("Estimated put value", f"{result.price:,.4f}")
+    core_columns[1].metric("Monte Carlo standard error", f"{result.standard_error:,.4f}")
     low, high = result.confidence_interval
-    columns[2].metric("Approximate 95% interval", f"[{low:,.4f}, {high:,.4f}]")
-    _price_comparison(result, inputs)
+    core_columns[2].metric("Approximate 95% interval", f"[{low:,.4f}, {high:,.4f}]")
+
+    comparison_columns = st.columns(2)
+    market = inputs.market_put_price
+    comparison_columns[0].metric(
+        "Market put value",
+        "N/A" if market is None else f"{market:,.4f}",
+        delta=None if market is None else f"Model − market: {result.price - market:+,.4f}",
+        delta_color="off",
+    )
+    if inputs.exercise_style is ExerciseStyle.EUROPEAN:
+        comparison_columns[1].metric(
+            "Black–Scholes exact value",
+            f"{result.european_exact_price:,.4f}",
+            delta=f"MC − exact: {result.european_mc_price - result.european_exact_price:+,.4f}",
+            delta_color="off",
+        )
+        st.caption(
+            "The European comparison validates terminal-payoff Monte Carlo against the "
+            "closed-form Black–Scholes value under the same model inputs."
+        )
+    else:
+        comparison_columns[1].metric(
+            "European Monte Carlo value",
+            f"{result.european_mc_price:,.4f}",
+            delta=f"American − European: {result.price - result.european_mc_price:+,.4f}",
+            delta_color="off",
+        )
+        st.caption(
+            "The American–European difference is the estimated value added by the "
+            "LSMC early-exercise feature under the same simulated paths."
+        )
+    st.caption(f"Market reference: {inputs.market_put_price_source}")
     st.plotly_chart(convergence_figure(result), use_container_width=True)
     st.caption(
         "The line is the cumulative mean of discounted pathwise payoffs; the band is "
@@ -333,13 +372,31 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
     if result.exercise_percentages is not None:
         st.plotly_chart(exercise_figure(result), use_container_width=True)
         st.caption(
-            "Each path is counted once at its final LSMC stopping time. Paths that "
-            "expire out of the money are not counted as exercised."
+            "Each path is counted once at its earliest selected exercise time; paths "
+            "that expire out of the money are not counted. Being in the money does "
+            "not automatically trigger exercise because continuation may be more "
+            "valuable. These percentages are risk-neutral model estimates, not a "
+            "forecast of how many investors will exercise."
         )
-    st.plotly_chart(paths_figure(result), use_container_width=True)
+    st.plotly_chart(paths_figure(result, inputs.contract), use_container_width=True)
+    st.caption(
+        "The shaded area contains the central 90% of simulated asset prices at each "
+        "time step; it is a path-distribution band, not a confidence interval."
+    )
     left, right = st.columns(2)
     left.plotly_chart(terminal_figure(result, inputs.contract), use_container_width=True)
     right.plotly_chart(payoff_figure(result, inputs.contract), use_container_width=True)
+    st.plotly_chart(cash_flow_figure(result), use_container_width=True)
+    if result.exercise_style is ExerciseStyle.AMERICAN:
+        st.caption(
+            "American cash flows use each path's final LSMC stopping time and are "
+            "discounted from that exercise time to time zero."
+        )
+    else:
+        st.caption(
+            "European cash flows are terminal put payoffs discounted from maturity "
+            "to time zero."
+        )
 
     rows = [
         ("Exercise style", inputs.exercise_style.value),
@@ -355,47 +412,6 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
     ]
     st.subheader("Inputs and provenance")
     st.dataframe(pd.DataFrame(rows, columns=["Input", "Value or source"]), hide_index=True, use_container_width=True)
-
-
-def _price_comparison(result: PricingResult, inputs: DashboardInputs) -> None:
-    market = inputs.market_put_price
-    rows = [
-        {
-            "Comparison": f"{inputs.exercise_style.value} {result.pricing_method} vs market",
-            "Estimated value": result.price,
-            "Monte Carlo SE": result.standard_error,
-            "Reference": "Observed Yahoo put price",
-            "Reference value": market,
-            "Difference (estimate − reference)": None if market is None else result.price - market,
-        },
-        {
-            "Comparison": "European Monte Carlo vs exact solution",
-            "Estimated value": result.european_mc_price,
-            "Monte Carlo SE": result.european_mc_standard_error,
-            "Reference": "Black–Scholes European put",
-            "Reference value": result.european_exact_price,
-            "Difference (estimate − reference)": (
-                result.european_mc_price - result.european_exact_price
-            ),
-        },
-    ]
-    comparison = pd.DataFrame(rows)
-    st.subheader("Price comparison")
-    st.dataframe(
-        comparison.style.format(
-            {
-                "Estimated value": "{:,.4f}",
-                "Monte Carlo SE": "{:,.4f}",
-                "Reference value": lambda value: "N/A" if pd.isna(value) else f"{value:,.4f}",
-                "Difference (estimate − reference)": (
-                    lambda value: "N/A" if pd.isna(value) else f"{value:+,.4f}"
-                ),
-            }
-        ),
-        hide_index=True,
-        use_container_width=True,
-    )
-    st.caption(f"Market reference: {inputs.market_put_price_source}")
 
 
 def _methodology() -> None:
