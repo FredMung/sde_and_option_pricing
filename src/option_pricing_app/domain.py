@@ -11,6 +11,20 @@ class ExerciseStyle(str, Enum):
     AMERICAN = "American"
 
 
+PRICE_BASIS_TERMS = ("1", "S", "S²")
+HESTON_BASIS_TERMS = (
+    "1",
+    "S",
+    "S²",
+    "v",
+    "v²",
+    "S·v",
+    "S²·v",
+    "S·v²",
+    "S²·v²",
+)
+
+
 @dataclass(frozen=True)
 class PutContract:
     strike: float
@@ -35,11 +49,36 @@ class MarketInputs:
 
 
 @dataclass(frozen=True)
+class HestonInputs:
+    mean_reversion_speed: float = 2.0
+    long_run_variance: float = 0.04
+    volatility_of_variance: float = 0.30
+    correlation: float = -0.70
+    initial_variance: float = 0.04
+
+    def __post_init__(self) -> None:
+        _positive("mean_reversion_speed", self.mean_reversion_speed)
+        _positive("long_run_variance", self.long_run_variance)
+        _positive("volatility_of_variance", self.volatility_of_variance)
+        _positive("initial_variance", self.initial_variance)
+        if not np.isfinite(self.correlation) or not -1.0 <= self.correlation <= 1.0:
+            raise ValueError("correlation must be finite and between -1 and 1")
+
+    @property
+    def satisfies_feller_condition(self) -> bool:
+        return (
+            2.0 * self.mean_reversion_speed * self.long_run_variance
+            >= self.volatility_of_variance**2
+        )
+
+
+@dataclass(frozen=True)
 class SimulationConfig:
     n_paths: int = 1_000
     n_steps: int = 100
     seed: int | None = 42
     max_display_paths: int = 100
+    basis_terms: tuple[str, ...] = PRICE_BASIS_TERMS
 
     def __post_init__(self) -> None:
         if isinstance(self.n_paths, bool) or not isinstance(self.n_paths, int):
@@ -56,6 +95,11 @@ class SimulationConfig:
             raise ValueError("seed must be a non-negative integer or None")
         if not 1 <= self.max_display_paths <= 100:
             raise ValueError("max_display_paths must be between 1 and 100")
+        if not self.basis_terms:
+            raise ValueError("at least one LSMC basis term must be selected")
+        unknown_terms = set(self.basis_terms) - set(HESTON_BASIS_TERMS)
+        if unknown_terms:
+            raise ValueError(f"unsupported LSMC basis terms: {sorted(unknown_terms)}")
 
 
 @dataclass(frozen=True)
@@ -68,6 +112,11 @@ class PricingResult:
     path_quantile_05: np.ndarray
     path_quantile_95: np.ndarray
     risk_neutral_expected_path: np.ndarray
+    displayed_variance_paths: np.ndarray | None
+    variance_quantile_05: np.ndarray | None
+    variance_quantile_95: np.ndarray | None
+    expected_variance_path: np.ndarray | None
+    long_run_variance: float | None
     terminal_prices: np.ndarray
     terminal_payoffs: np.ndarray
     discounted_realised_cash_flows: np.ndarray
@@ -76,7 +125,7 @@ class PricingResult:
     pricing_method: str
     european_mc_price: float
     european_mc_standard_error: float
-    european_exact_price: float
+    european_exact_price: float | None
     convergence_path_counts: np.ndarray
     convergence_estimates: np.ndarray
     convergence_lower: np.ndarray

@@ -2,6 +2,7 @@
 
 from option_pricing_app.domain import (
     ExerciseStyle,
+    HestonInputs,
     MarketInputs,
     PricingResult,
     PutContract,
@@ -11,6 +12,7 @@ from option_pricing_app.service import price_put
 
 __all__ = [
     "ExerciseStyle",
+    "HestonInputs",
     "MarketInputs",
     "PricingResult",
     "PutContract",

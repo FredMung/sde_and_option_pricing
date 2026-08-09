@@ -60,3 +60,18 @@ def test_app_starts_and_generates_manual_result():
         "Market put value",
         "European Monte Carlo value",
     ]
+
+    next(widget for widget in app.selectbox if widget.label == "Asset-price model").select(
+        "Heston"
+    )
+    app.run(timeout=30)
+    assert not app.exception
+    assert any(
+        widget.label == "Initial volatility, √v₀ (%)" for widget in app.number_input
+    )
+    next(button for button in app.button if button.label == "Generate simulation").click()
+    app.run(timeout=30)
+    assert not app.exception
+    result, _inputs = app.session_state["pricing_output"]
+    assert result.model_name == "Heston"
+    assert result.displayed_variance_paths is not None

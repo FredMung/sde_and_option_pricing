@@ -13,9 +13,13 @@ from option_pricing_app.app.charts import (
     paths_figure,
     payoff_figure,
     terminal_figure,
+    variance_paths_figure,
 )
 from option_pricing_app.domain import (
+    HESTON_BASIS_TERMS,
+    PRICE_BASIS_TERMS,
     ExerciseStyle,
+    HestonInputs,
     MarketInputs,
     PricingResult,
     PutContract,
@@ -46,6 +50,7 @@ class DashboardInputs:
     simulation: SimulationConfig
     exercise_style: ExerciseStyle
     model: str
+    heston_inputs: HestonInputs | None
     market_put_price: float | None
     market_put_price_source: str
     sources: tuple[tuple[str, str], ...]
@@ -79,7 +84,7 @@ def cached_treasury_curve() -> TreasuryCurve:
 def run_dashboard() -> None:
     st.set_page_config(page_title="SDE Option-Pricing Lab", page_icon="📈", layout="wide")
     st.title("SDE Option-Pricing Lab")
-    st.caption("Single-asset put pricing with GBM, Monte Carlo, and LSMC")
+    st.caption("Single-asset put pricing with GBM, Heston, Monte Carlo, and LSMC")
     st.warning(DISCLAIMER, icon="⚠️")
 
     inputs = _controls()
@@ -94,6 +99,7 @@ def run_dashboard() -> None:
                     inputs.simulation,
                     inputs.exercise_style,
                     inputs.model,
+                    inputs.heston_inputs,
                 )
             st.session_state["pricing_output"] = (result, inputs)
         except (ValueError, FloatingPointError) as exc:
@@ -115,7 +121,7 @@ def _controls() -> DashboardInputs | None:
         st.session_state.pop("maturity_choice", None)
         st.session_state.pop("pricing_output", None)
 
-    model = sidebar.selectbox("Asset-price model", ["GBM"])
+    model = sidebar.selectbox("Asset-price model", ["GBM", "Heston"])
     exercise_style = ExerciseStyle(
         sidebar.selectbox(
             "Exercise style",
@@ -207,12 +213,35 @@ def _controls() -> DashboardInputs | None:
             ("Risk-free rate", rate_source),
         )
 
+    heston_inputs = _heston_controls(volatility) if model == "Heston" else None
+
     sidebar.divider()
     sidebar.subheader("Simulation")
     n_paths = int(
         sidebar.number_input("Number of paths", 100, 25_000, 1_000, step=500)
     )
     n_steps = int(sidebar.number_input("Number of time steps", 1, 1_000, 100, step=10))
+    if exercise_style is ExerciseStyle.AMERICAN:
+        basis_options = HESTON_BASIS_TERMS if model == "Heston" else PRICE_BASIS_TERMS
+        default_basis = (
+            ("1", "S", "S²", "v", "v²", "S·v")
+            if model == "Heston"
+            else PRICE_BASIS_TERMS
+        )
+        basis_terms = tuple(
+            sidebar.multiselect(
+                "LSMC basis terms",
+                basis_options,
+                default=default_basis,
+                key=f"lsmc_basis_{model.lower()}",
+                help=(
+                    "Regression terms for continuation value. Heston also permits "
+                    "variance powers and price–variance cross-terms up to power two."
+                ),
+            )
+        )
+    else:
+        basis_terms = PRICE_BASIS_TERMS
     with sidebar.expander("Advanced settings"):
         fixed_seed = st.checkbox("Use a reproducible random seed", value=True)
         seed = int(st.number_input("Random seed", 0, value=42)) if fixed_seed else None
@@ -221,9 +250,16 @@ def _controls() -> DashboardInputs | None:
         return DashboardInputs(
             PutContract(strike, maturity),
             MarketInputs(spot, volatility, rate),
-            SimulationConfig(n_paths, n_steps, seed, min(100, n_paths)),
+            SimulationConfig(
+                n_paths,
+                n_steps,
+                seed,
+                min(100, n_paths),
+                basis_terms,
+            ),
             exercise_style,
             model,
+            heston_inputs,
             market_put_price,
             market_put_price_source,
             sources,
@@ -231,6 +267,54 @@ def _controls() -> DashboardInputs | None:
     except ValueError as exc:
         sidebar.error(str(exc))
         return None
+
+
+def _heston_controls(reference_volatility: float) -> HestonInputs:
+    sidebar = st.sidebar
+    sidebar.divider()
+    sidebar.subheader("Heston variance process")
+    initial_volatility = float(
+        sidebar.number_input(
+            "Initial volatility, √v₀ (%)",
+            min_value=0.01,
+            max_value=500.0,
+            value=float(reference_volatility * 100.0),
+        )
+    ) / 100.0
+    long_run_volatility = float(
+        sidebar.number_input(
+            "Long-run volatility, √θ (%)",
+            min_value=0.01,
+            max_value=500.0,
+            value=float(reference_volatility * 100.0),
+        )
+    ) / 100.0
+    mean_reversion_speed = float(
+        sidebar.number_input("Mean-reversion speed, κ", 0.01, 20.0, 2.0, step=0.1)
+    )
+    volatility_of_variance = float(
+        sidebar.number_input("Volatility of variance, ξ", 0.001, 5.0, 0.30, step=0.05)
+    )
+    correlation = float(
+        sidebar.number_input("Price–variance correlation, ρ", -1.0, 1.0, -0.70, step=0.05)
+    )
+    inputs = HestonInputs(
+        mean_reversion_speed=mean_reversion_speed,
+        long_run_variance=long_run_volatility**2,
+        volatility_of_variance=volatility_of_variance,
+        correlation=correlation,
+        initial_variance=initial_volatility**2,
+    )
+    sidebar.caption(
+        f"Initial variance v₀={inputs.initial_variance:.6f}; "
+        f"long-run variance θ={inputs.long_run_variance:.6f}."
+    )
+    if not inputs.satisfies_feller_condition:
+        sidebar.warning(
+            "The Feller condition 2κθ ≥ ξ² is not satisfied; the full-truncation "
+            "scheme keeps simulated variance non-negative."
+        )
+    return inputs
 
 
 def _live_strike(chain: OptionChain, spot: float) -> tuple[float, str]:
@@ -341,7 +425,10 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
         delta=None if market is None else f"Model − market: {result.price - market:+,.4f}",
         delta_color="off",
     )
-    if inputs.exercise_style is ExerciseStyle.EUROPEAN:
+    if (
+        inputs.exercise_style is ExerciseStyle.EUROPEAN
+        and result.european_exact_price is not None
+    ):
         comparison_columns[1].metric(
             "Black–Scholes exact value",
             f"{result.european_exact_price:,.4f}",
@@ -351,6 +438,12 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
         st.caption(
             "The European comparison validates terminal-payoff Monte Carlo against the "
             "closed-form Black–Scholes value under the same model inputs."
+        )
+    elif inputs.exercise_style is ExerciseStyle.EUROPEAN:
+        comparison_columns[1].metric("Heston benchmark", "Not implemented")
+        st.caption(
+            "The European Heston value is estimated by Monte Carlo; a semi-analytical "
+            "Heston benchmark is not implemented in this application."
         )
     else:
         comparison_columns[1].metric(
@@ -383,6 +476,12 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
         "The shaded area contains the central 90% of simulated asset prices at each "
         "time step; it is a path-distribution band, not a confidence interval."
     )
+    if result.displayed_variance_paths is not None:
+        st.plotly_chart(variance_paths_figure(result), use_container_width=True)
+        st.caption(
+            "Variance is volatility squared. The shaded area contains the central "
+            "90% of simulated Heston variance values at each time step."
+        )
     left, right = st.columns(2)
     left.plotly_chart(terminal_figure(result, inputs.contract), use_container_width=True)
     right.plotly_chart(payoff_figure(result, inputs.contract), use_container_width=True)
@@ -404,12 +503,34 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
         ("Initial price", f"{inputs.market.spot:,.4f}"),
         ("Strike", f"{inputs.contract.strike:,.4f}"),
         ("Maturity", f"{inputs.contract.maturity:.6f} years"),
-        ("Volatility", f"{inputs.market.volatility:.4%}"),
+        (
+            "Reference volatility" if inputs.model == "Heston" else "Volatility",
+            f"{inputs.market.volatility:.4%}",
+        ),
         ("Risk-free rate", f"{inputs.market.risk_free_rate:.4%}"),
         ("Paths / steps", f"{inputs.simulation.n_paths:,} / {inputs.simulation.n_steps:,}"),
         ("Seed", str(inputs.simulation.seed)),
+        *(
+            [("LSMC basis terms", ", ".join(inputs.simulation.basis_terms))]
+            if inputs.exercise_style is ExerciseStyle.AMERICAN
+            else []
+        ),
         *inputs.sources,
     ]
+    if inputs.heston_inputs is not None:
+        rows.extend(
+            [
+                ("Heston initial variance, v₀", f"{inputs.heston_inputs.initial_variance:.6f}"),
+                ("Heston long-run variance, θ", f"{inputs.heston_inputs.long_run_variance:.6f}"),
+                ("Heston mean-reversion speed, κ", f"{inputs.heston_inputs.mean_reversion_speed:.4f}"),
+                ("Heston volatility of variance, ξ", f"{inputs.heston_inputs.volatility_of_variance:.4f}"),
+                ("Heston price–variance correlation, ρ", f"{inputs.heston_inputs.correlation:.4f}"),
+                (
+                    "Heston Feller condition",
+                    "Satisfied" if inputs.heston_inputs.satisfies_feller_condition else "Not satisfied",
+                ),
+            ]
+        )
     st.subheader("Inputs and provenance")
     st.dataframe(pd.DataFrame(rows, columns=["Input", "Value or source"]), hide_index=True, use_container_width=True)
 
@@ -421,14 +542,26 @@ def _methodology() -> None:
             r"S_{t+\Delta t}=S_t\exp\left[(r-\tfrac12\sigma^2)\Delta t"
             r"+\sigma\sqrt{\Delta t}Z\right],\quad Z\sim N(0,1)"
         )
+        st.markdown("**Heston stochastic variance under the risk-neutral measure**")
+        st.latex(
+            r"dS_t=rS_tdt+\sqrt{v_t}S_tdW_t^S,\qquad "
+            r"dv_t=\kappa(\theta-v_t)dt+\xi\sqrt{v_t}dW_t^v,\qquad "
+            r"dW_t^S dW_t^v=\rho dt"
+        )
         st.markdown(
             """
             A European put is the average discounted terminal payoff. For an
             American put, LSMC works backwards through possible exercise dates,
             estimates continuation values by regression, and compares continuation
-            with immediate exercise. The exact European reference uses the
-            no-dividend Black–Scholes put formula with the same spot, strike,
-            maturity, volatility, and risk-free rate as the simulation.
+            with immediate exercise. Under Heston, continuation regression may
+            include price, variance, their squares, and selected cross-products.
+            The exact European reference is shown only for GBM and uses the
+            no-dividend Black–Scholes put formula with the same model inputs.
+
+            Heston variance is simulated with a non-negative full-truncation
+            Euler step, while the asset uses an exponential log-Euler step. The
+            market volatility supplies initial defaults rather than a calibrated
+            Heston parameter set.
 
             The interval shown measures Monte Carlo sampling uncertainty only. It
             excludes model risk, dividends, volatility-surface effects, transaction

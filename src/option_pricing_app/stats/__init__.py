@@ -1,6 +1,9 @@
 """Statistical models migrated from the dissertation repository."""
 
-from option_pricing_app.stats.gbm_simulator import GBMPriceSimulator
-from option_pricing_app.stats.lsmc_simulator import LSMCPriceSimulator
+from option_pricing_app.stats.asset_pricing_simulator import (
+    GBMPriceSimulator,
+    HestonPriceSimulator,
+)
+from option_pricing_app.stats.option_pricing_simulator import LSMCPriceSimulator
 
-__all__ = ["GBMPriceSimulator", "LSMCPriceSimulator"]
+__all__ = ["GBMPriceSimulator", "HestonPriceSimulator", "LSMCPriceSimulator"]

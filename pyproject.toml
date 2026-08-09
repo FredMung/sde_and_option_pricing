@@ -1,7 +1,7 @@
 [project]
 name = "sde-application-in-option-pricing-streamlit"
 version = "0.1.0"
-description = "Master's-level Streamlit proof of concept for GBM and LSMC put pricing"
+description = "Master's-level Streamlit proof of concept for GBM, Heston, and LSMC put pricing"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [

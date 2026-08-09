@@ -77,6 +77,88 @@ def paths_figure(result: PricingResult, contract: PutContract) -> go.Figure:
     return figure
 
 
+def variance_paths_figure(result: PricingResult) -> go.Figure:
+    """Plot Heston instantaneous variance paths and their distribution envelope."""
+    if (
+        result.displayed_variance_paths is None
+        or result.variance_quantile_05 is None
+        or result.variance_quantile_95 is None
+        or result.expected_variance_path is None
+        or result.long_run_variance is None
+    ):
+        raise ValueError("Variance paths are only available for the Heston model")
+
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=result.time_grid,
+            y=result.variance_quantile_95,
+            mode="lines",
+            line={"width": 0},
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=result.time_grid,
+            y=result.variance_quantile_05,
+            customdata=result.variance_quantile_95,
+            mode="lines",
+            line={"width": 0},
+            fill="tonexty",
+            fillcolor="rgba(42, 122, 102, 0.15)",
+            name="5–95% variance band",
+            hovertemplate=(
+                "t=%{x:.3f} years<br>5th percentile=%{y:.6f}"
+                "<br>95th percentile=%{customdata:.6f}<extra></extra>"
+            ),
+        )
+    )
+    for path in result.displayed_variance_paths.T:
+        figure.add_trace(
+            go.Scatter(
+                x=result.time_grid,
+                y=path,
+                mode="lines",
+                line={"width": 1, "color": "rgba(42, 122, 102, 0.20)"},
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+    figure.add_trace(
+        go.Scatter(
+            x=result.time_grid,
+            y=result.expected_variance_path,
+            mode="lines",
+            line={"width": 3, "dash": "dash", "color": "#ff7f0e"},
+            name="Expected variance",
+            hovertemplate="t=%{x:.3f} years<br>E[v]=%{y:.6f}<extra></extra>",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=result.time_grid,
+            y=np.full_like(result.time_grid, result.long_run_variance),
+            mode="lines",
+            line={"width": 2, "color": "#7a3e9d"},
+            name=f"Long-run variance θ = {result.long_run_variance:.6f}",
+            hovertemplate=(
+                f"Long-run variance θ={result.long_run_variance:.6f}<extra></extra>"
+            ),
+        )
+    )
+    figure.update_layout(
+        title="Heston instantaneous variance paths",
+        xaxis_title="Time (years)",
+        yaxis_title="Variance, v (volatility²)",
+        template="plotly_white",
+        height=470,
+        hovermode="x unified",
+    )
+    return figure
+
+
 def terminal_figure(result: PricingResult, contract: PutContract) -> go.Figure:
     figure = go.Figure(
         go.Histogram(x=result.terminal_prices, nbinsx=50, marker_color="#245b82")
@@ -196,7 +278,10 @@ def convergence_figure(result: PricingResult) -> go.Figure:
             hovertemplate="Paths=%{x:,}<br>Estimate=%{y:.4f}<extra></extra>",
         )
     )
-    if result.exercise_style is ExerciseStyle.EUROPEAN:
+    if (
+        result.exercise_style is ExerciseStyle.EUROPEAN
+        and result.european_exact_price is not None
+    ):
         figure.add_hline(
             y=result.european_exact_price,
             line_dash="dash",
