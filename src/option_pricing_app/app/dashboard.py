@@ -45,6 +45,8 @@ class DashboardInputs:
     simulation: SimulationConfig
     exercise_style: ExerciseStyle
     model: str
+    market_put_price: float | None
+    market_put_price_source: str
     sources: tuple[tuple[str, str], ...]
 
 
@@ -174,6 +176,8 @@ def _controls() -> DashboardInputs | None:
                 "Risk-free rate (%)", min_value=-99.0, max_value=99.0, key="manual_rate"
             )
         ) / 100
+        market_put_price = None
+        market_put_price_source = "Unavailable in manual market mode"
         sources = (
             ("Spot", "Manual"),
             ("Maturity", "Manual year fraction"),
@@ -186,6 +190,7 @@ def _controls() -> DashboardInputs | None:
         spot = quote.price
         maturity = _maturity(expiry)
         strike, strike_source = _live_strike(chain, spot)
+        market_put_price, market_put_price_source = _live_market_price(chain, strike)
         volatility, volatility_source = _live_volatility(chain, ticker, strike)
         rate, rate_source = _live_rate(maturity)
         sources = (
@@ -213,6 +218,8 @@ def _controls() -> DashboardInputs | None:
             SimulationConfig(n_paths, n_steps, seed, min(100, n_paths)),
             exercise_style,
             model,
+            market_put_price,
+            market_put_price_source,
             sources,
         )
     except ValueError as exc:
@@ -250,6 +257,19 @@ def _live_volatility(chain: OptionChain, ticker: str, strike: float) -> tuple[fl
     except MarketDataError as exc:
         st.sidebar.warning(f"{exc} Enter volatility manually.")
         return float(st.sidebar.number_input("Fallback volatility (%)", 0.01, 500.0, 20.0)) / 100, "Manual fallback"
+
+
+def _live_market_price(chain: OptionChain, strike: float) -> tuple[float | None, str]:
+    try:
+        quote = YahooFinanceClient.put_market_price(chain, strike)
+    except MarketDataError as exc:
+        st.sidebar.caption(f"Market-price comparison unavailable: {exc}")
+        return None, str(exc)
+    source = (
+        f"Yahoo put {quote.basis} at K={quote.strike:,.2f}; "
+        f"retrieved {quote.observed_at:%Y-%m-%d %H:%M UTC}"
+    )
+    return quote.price, source
 
 
 def _live_rate(maturity: float) -> tuple[float, str]:
@@ -304,6 +324,7 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
     columns[1].metric("Monte Carlo standard error", f"{result.standard_error:,.4f}")
     low, high = result.confidence_interval
     columns[2].metric("Approximate 95% interval", f"[{low:,.4f}, {high:,.4f}]")
+    _price_comparison(result, inputs)
     st.plotly_chart(convergence_figure(result), use_container_width=True)
     st.caption(
         "The line is the cumulative mean of discounted pathwise payoffs; the band is "
@@ -336,6 +357,47 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
     st.dataframe(pd.DataFrame(rows, columns=["Input", "Value or source"]), hide_index=True, use_container_width=True)
 
 
+def _price_comparison(result: PricingResult, inputs: DashboardInputs) -> None:
+    market = inputs.market_put_price
+    rows = [
+        {
+            "Comparison": f"{inputs.exercise_style.value} {result.pricing_method} vs market",
+            "Estimated value": result.price,
+            "Monte Carlo SE": result.standard_error,
+            "Reference": "Observed Yahoo put price",
+            "Reference value": market,
+            "Difference (estimate − reference)": None if market is None else result.price - market,
+        },
+        {
+            "Comparison": "European Monte Carlo vs exact solution",
+            "Estimated value": result.european_mc_price,
+            "Monte Carlo SE": result.european_mc_standard_error,
+            "Reference": "Black–Scholes European put",
+            "Reference value": result.european_exact_price,
+            "Difference (estimate − reference)": (
+                result.european_mc_price - result.european_exact_price
+            ),
+        },
+    ]
+    comparison = pd.DataFrame(rows)
+    st.subheader("Price comparison")
+    st.dataframe(
+        comparison.style.format(
+            {
+                "Estimated value": "{:,.4f}",
+                "Monte Carlo SE": "{:,.4f}",
+                "Reference value": lambda value: "N/A" if pd.isna(value) else f"{value:,.4f}",
+                "Difference (estimate − reference)": (
+                    lambda value: "N/A" if pd.isna(value) else f"{value:+,.4f}"
+                ),
+            }
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.caption(f"Market reference: {inputs.market_put_price_source}")
+
+
 def _methodology() -> None:
     with st.expander("Methodology and interpretation"):
         st.markdown("**GBM under the risk-neutral measure**")
@@ -348,10 +410,14 @@ def _methodology() -> None:
             A European put is the average discounted terminal payoff. For an
             American put, LSMC works backwards through possible exercise dates,
             estimates continuation values by regression, and compares continuation
-            with immediate exercise.
+            with immediate exercise. The exact European reference uses the
+            no-dividend Black–Scholes put formula with the same spot, strike,
+            maturity, volatility, and risk-free rate as the simulation.
 
             The interval shown measures Monte Carlo sampling uncertainty only. It
             excludes model risk, dividends, volatility-surface effects, transaction
-            costs, liquidity, and calibration error.
+            costs, liquidity, and calibration error. Yahoo quotes may be delayed;
+            the displayed midpoint falls back to the last trade when a valid bid
+            and ask are unavailable.
             """
         )

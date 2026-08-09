@@ -25,6 +25,14 @@ class OptionChain:
 
 
 @dataclass(frozen=True)
+class PutMarketPrice:
+    price: float
+    strike: float
+    basis: str
+    observed_at: datetime
+
+
+@dataclass(frozen=True)
 class ImpliedVolatility:
     volatility: float
     requested_strike: float

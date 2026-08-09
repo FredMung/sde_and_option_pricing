@@ -8,6 +8,7 @@ from option_pricing_app.market_data.models import (
     ImpliedVolatility,
     MarketDataError,
     OptionChain,
+    PutMarketPrice,
     Quote,
 )
 
@@ -92,6 +93,25 @@ class YahooFinanceClient:
         row = frame.loc[index]
         return ImpliedVolatility(float(row.impliedVolatility), float(strike), float(row.strike))
 
+    @staticmethod
+    def put_market_price(chain: OptionChain, strike: float) -> PutMarketPrice:
+        """Return the midpoint, or last trade, for an exact listed put strike."""
+        strikes = pd.to_numeric(chain.puts["strike"], errors="coerce")
+        matches = chain.puts[np.isclose(strikes, strike, rtol=0.0, atol=1e-8)]
+        if matches.empty:
+            raise MarketDataError(f"No listed put market price matched K={strike:,.2f}.")
+
+        row = matches.iloc[0]
+        bid = _positive_number(row.get("bid"))
+        ask = _positive_number(row.get("ask"))
+        if bid is not None and ask is not None and ask >= bid:
+            return PutMarketPrice((bid + ask) / 2.0, float(strike), "bid–ask midpoint", chain.observed_at)
+
+        last_price = _positive_number(row.get("lastPrice"))
+        if last_price is not None:
+            return PutMarketPrice(last_price, float(strike), "last traded price", chain.observed_at)
+        raise MarketDataError(f"No valid market quote was available for the K={strike:,.2f} put.")
+
 
 def _ticker(value: str) -> str:
     symbol = value.strip().upper()
@@ -104,3 +124,11 @@ def _close(history: pd.DataFrame) -> pd.Series:
     if history.empty or "Close" not in history:
         raise MarketDataError("Yahoo Finance returned no closing prices.")
     return history["Close"]
+
+
+def _positive_number(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) and number > 0 else None

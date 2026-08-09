@@ -70,6 +70,9 @@ class PricingResult:
     exercise_style: ExerciseStyle
     model_name: str
     pricing_method: str
+    european_mc_price: float
+    european_mc_standard_error: float
+    european_exact_price: float
     convergence_path_counts: np.ndarray
     convergence_estimates: np.ndarray
     convergence_lower: np.ndarray

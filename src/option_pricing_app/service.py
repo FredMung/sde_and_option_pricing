@@ -1,5 +1,6 @@
 """App-facing orchestration around the migrated pricing algorithms."""
 
+from math import erf, exp, log, sqrt
 from typing import Protocol, runtime_checkable
 
 import numpy as np
@@ -46,13 +47,19 @@ def price_put(
         config.n_paths,
         config.n_steps,
     )
+    european_pathwise_values = np.exp(
+        -market.risk_free_rate * contract.maturity
+    ) * np.maximum(contract.strike - paths[-1], 0.0)
+    european_mc_price = float(np.mean(european_pathwise_values))
+    european_mc_standard_error = float(
+        np.std(european_pathwise_values) / np.sqrt(config.n_paths)
+    )
+    european_exact_price = black_scholes_put_price(contract, market)
 
     if exercise_style is ExerciseStyle.EUROPEAN:
-        pathwise_values = np.exp(-market.risk_free_rate * contract.maturity) * np.maximum(
-            contract.strike - paths[-1], 0.0
-        )
-        price = float(np.mean(pathwise_values))
-        standard_error = float(np.std(pathwise_values) / np.sqrt(config.n_paths))
+        pathwise_values = european_pathwise_values
+        price = european_mc_price
+        standard_error = european_mc_standard_error
         exercise_percentages = None
         method = "Terminal-payoff Monte Carlo"
     elif exercise_style is ExerciseStyle.AMERICAN:
@@ -90,12 +97,31 @@ def price_put(
         exercise_style=exercise_style,
         model_name=model,
         pricing_method=method,
+        european_mc_price=european_mc_price,
+        european_mc_standard_error=european_mc_standard_error,
+        european_exact_price=european_exact_price,
         convergence_path_counts=path_counts,
         convergence_estimates=estimates,
         convergence_lower=convergence_low,
         convergence_upper=convergence_high,
         exercise_percentages=exercise_percentages,
     )
+
+
+def black_scholes_put_price(contract: PutContract, market: MarketInputs) -> float:
+    """Return the no-dividend European put price under Black–Scholes assumptions."""
+    volatility_time = market.volatility * sqrt(contract.maturity)
+    d1 = (
+        log(market.spot / contract.strike)
+        + (market.risk_free_rate + 0.5 * market.volatility**2) * contract.maturity
+    ) / volatility_time
+    d2 = d1 - volatility_time
+    discounted_strike = contract.strike * exp(-market.risk_free_rate * contract.maturity)
+    return float(discounted_strike * _normal_cdf(-d2) - market.spot * _normal_cdf(-d1))
+
+
+def _normal_cdf(value: float) -> float:
+    return 0.5 * (1.0 + erf(value / sqrt(2.0)))
 
 
 def _convergence_trace(

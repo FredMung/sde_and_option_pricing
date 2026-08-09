@@ -23,6 +23,47 @@ def test_nearest_strike_iv_is_reported_as_approximation():
     assert result.is_approximation
 
 
+def test_put_market_price_prefers_bid_ask_midpoint():
+    observed_at = pd.Timestamp("2026-01-01", tz="UTC").to_pydatetime()
+    chain = OptionChain(
+        "TEST",
+        "2030-01-01",
+        pd.DataFrame(
+            {
+                "strike": [100.0],
+                "impliedVolatility": [0.2],
+                "bid": [5.0],
+                "ask": [5.4],
+                "lastPrice": [4.9],
+            }
+        ),
+        observed_at,
+    )
+    quote = YahooFinanceClient.put_market_price(chain, 100.0)
+    assert quote.price == pytest.approx(5.2)
+    assert quote.basis == "bid–ask midpoint"
+
+
+def test_put_market_price_falls_back_to_last_trade():
+    chain = OptionChain(
+        "TEST",
+        "2030-01-01",
+        pd.DataFrame(
+            {
+                "strike": [100.0],
+                "impliedVolatility": [0.2],
+                "bid": [0.0],
+                "ask": [5.4],
+                "lastPrice": [5.1],
+            }
+        ),
+        pd.Timestamp("2026-01-01", tz="UTC").to_pydatetime(),
+    )
+    quote = YahooFinanceClient.put_market_price(chain, 100.0)
+    assert quote.price == pytest.approx(5.1)
+    assert quote.basis == "last traded price"
+
+
 def test_historical_volatility_uses_log_returns(monkeypatch):
     prices = 100 * np.exp(np.linspace(0, 0.1, 60) + np.sin(np.arange(60)) * 0.01)
     index = pd.date_range("2026-01-01", periods=60, freq="B", tz="UTC")

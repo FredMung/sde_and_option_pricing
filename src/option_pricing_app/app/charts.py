@@ -3,7 +3,7 @@
 import numpy as np
 import plotly.graph_objects as go
 
-from option_pricing_app.domain import PricingResult, PutContract
+from option_pricing_app.domain import ExerciseStyle, PricingResult, PutContract
 
 
 def paths_figure(result: PricingResult) -> go.Figure:
@@ -109,6 +109,13 @@ def convergence_figure(result: PricingResult) -> go.Figure:
             hovertemplate="Paths=%{x:,}<br>Estimate=%{y:.4f}<extra></extra>",
         )
     )
+    if result.exercise_style is ExerciseStyle.EUROPEAN:
+        figure.add_hline(
+            y=result.european_exact_price,
+            line_dash="dash",
+            line_color="#a43d3d",
+            annotation_text="Black–Scholes exact",
+        )
     figure.update_layout(
         title="Monte Carlo convergence by simulated path",
         xaxis_title="Number of paths included",

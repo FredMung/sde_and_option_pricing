@@ -4,6 +4,7 @@ from option_pricing_app.market_data.models import (
     ImpliedVolatility,
     MarketDataError,
     OptionChain,
+    PutMarketPrice,
     Quote,
     TreasuryCurve,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "ImpliedVolatility",
     "MarketDataError",
     "OptionChain",
+    "PutMarketPrice",
     "Quote",
     "TreasuryClient",
     "TreasuryCurve",
