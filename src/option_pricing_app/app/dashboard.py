@@ -41,6 +41,8 @@ DISCLAIMER = (
     "to provide production-grade valuations, trading signals, or investment advice."
 )
 MANUAL_MATURITY = "Manual maturity"
+MIN_PLAUSIBLE_IMPLIED_VOLATILITY = 0.05
+MAX_PLAUSIBLE_IMPLIED_VOLATILITY = 3.00
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,8 @@ class DashboardInputs:
     heston_inputs: HestonInputs | None
     market_put_price: float | None
     market_put_price_source: str
+    volatility_label: str
+    risk_free_rate_label: str
     sources: tuple[tuple[str, str], ...]
 
 
@@ -190,6 +194,8 @@ def _controls() -> DashboardInputs | None:
         ) / 100
         market_put_price = None
         market_put_price_source = "Unavailable in manual market mode"
+        volatility_label = "Manually input volatility"
+        risk_free_rate_label = "Manually input risk-free rate"
         sources = (
             ("Spot", "Manual"),
             ("Maturity", "Manual year fraction"),
@@ -203,8 +209,10 @@ def _controls() -> DashboardInputs | None:
         maturity = _maturity(expiry)
         strike, strike_source = _live_strike(chain, spot)
         market_put_price, market_put_price_source = _live_market_price(chain, strike)
-        volatility, volatility_source = _live_volatility(chain, ticker, strike)
-        rate, rate_source = _live_rate(maturity)
+        volatility, volatility_source, volatility_label = _live_volatility(
+            chain, ticker, strike
+        )
+        rate, rate_source, risk_free_rate_label = _live_rate(maturity)
         sources = (
             ("Spot", f"Yahoo Finance; retrieved {quote.observed_at:%Y-%m-%d %H:%M UTC}"),
             ("Maturity", f"Yahoo listed expiry {expiry}; ACT/365.25"),
@@ -262,6 +270,8 @@ def _controls() -> DashboardInputs | None:
             heston_inputs,
             market_put_price,
             market_put_price_source,
+            volatility_label,
+            risk_free_rate_label,
             sources,
         )
     except ValueError as exc:
@@ -326,27 +336,63 @@ def _live_strike(chain: OptionChain, spot: float) -> tuple[float, str]:
     return float(st.sidebar.number_input("Strike, K", 0.01, value=round(spot, 2))), "Manual"
 
 
-def _live_volatility(chain: OptionChain, ticker: str, strike: float) -> tuple[float, str]:
+def _live_volatility(
+    chain: OptionChain, ticker: str, strike: float
+) -> tuple[float, str, str]:
     source = st.sidebar.selectbox(
         "Volatility source", ["Implied volatility", "Historical volatility", "Manual volatility"]
     )
     if source == "Manual volatility":
-        return float(st.sidebar.number_input("Volatility (%)", 0.01, 500.0, 20.0)) / 100, "Manual"
+        return (
+            float(st.sidebar.number_input("Volatility (%)", 0.01, 500.0, 20.0)) / 100,
+            "Manual",
+            "Manually input volatility",
+        )
     try:
         if source == "Historical volatility":
             value, observed = cached_historical_volatility(ticker)
             st.sidebar.caption(f"1-year annualised volatility: {value:.2%}")
-            return value, f"Yahoo adjusted closes through {observed:%Y-%m-%d}; √252"
+            return (
+                value,
+                f"Yahoo adjusted closes through {observed:%Y-%m-%d}; √252",
+                "Historical volatility",
+            )
         estimate = YahooFinanceClient.nearest_implied_volatility(chain, strike)
         st.sidebar.caption(f"Put-chain implied volatility: {estimate.volatility:.2%}")
         if estimate.is_approximation:
             st.sidebar.warning(
                 f"Using IV from nearest listed strike K={estimate.matched_strike:,.2f}."
             )
-        return estimate.volatility, f"Yahoo put IV at K={estimate.matched_strike:,.2f}"
+        if not is_plausible_implied_volatility(estimate.volatility):
+            value, observed = cached_historical_volatility(ticker)
+            st.sidebar.warning(
+                f"Yahoo's put IV of {estimate.volatility:.2%} is outside the "
+                "5%–300% data-quality range. Using one-year historical volatility "
+                f"of {value:.2%} instead."
+            )
+            return (
+                value,
+                (
+                    f"Yahoo adjusted closes through {observed:%Y-%m-%d}; √252 "
+                    f"(fallback from implausible {estimate.volatility:.2%} put IV)"
+                ),
+                "Historical volatility (IV fallback)",
+            )
+        return (
+            estimate.volatility,
+            f"Yahoo put IV at K={estimate.matched_strike:,.2f}",
+            "Implied volatility",
+        )
     except MarketDataError as exc:
         st.sidebar.warning(f"{exc} Enter volatility manually.")
-        return float(st.sidebar.number_input("Fallback volatility (%)", 0.01, 500.0, 20.0)) / 100, "Manual fallback"
+        return (
+            float(
+                st.sidebar.number_input("Fallback volatility (%)", 0.01, 500.0, 20.0)
+            )
+            / 100,
+            "Manual fallback",
+            "Manually input volatility (fallback)",
+        )
 
 
 def _live_market_price(chain: OptionChain, strike: float) -> tuple[float | None, str]:
@@ -362,20 +408,42 @@ def _live_market_price(chain: OptionChain, strike: float) -> tuple[float | None,
     return quote.price, source
 
 
-def _live_rate(maturity: float) -> tuple[float, str]:
+def _live_rate(maturity: float) -> tuple[float, str, str]:
     source = st.sidebar.radio("Risk-free-rate source", ["U.S. Treasury curve", "Manual rate"])
     if source == "Manual rate":
-        return float(st.sidebar.number_input("Risk-free rate (%)", -99.0, 99.0, 4.0)) / 100, "Manual"
+        return (
+            float(st.sidebar.number_input("Risk-free rate (%)", -99.0, 99.0, 4.0)) / 100,
+            "Manual",
+            "Manually input risk-free rate",
+        )
     try:
         curve = cached_treasury_curve()
         value, outside = curve.rate_for_maturity(maturity)
         st.sidebar.caption(f"Treasury par-yield proxy: {value:.2%} ({curve.as_of})")
         if outside:
-            st.sidebar.warning("Maturity is outside the curve; nearest boundary used.")
-        return value, f"U.S. Treasury par curve dated {curve.as_of}; interpolated proxy"
+            boundary = "shortest" if maturity < curve.maturities[0] else "longest"
+            message = (
+                f"Selected expiry is outside the Treasury curve; the {boundary} "
+                "available tenor is used."
+            )
+            if maturity < curve.maturities[0]:
+                st.sidebar.caption(message)
+            else:
+                st.sidebar.warning(message)
+        source = f"U.S. Treasury par curve dated {curve.as_of}; interpolated proxy"
+        if outside:
+            source += f" ({boundary} available tenor used)"
+        return value, source, "U.S. Treasury risk-free rate"
     except MarketDataError as exc:
         st.sidebar.warning(f"{exc} Enter a rate manually.")
-        return float(st.sidebar.number_input("Fallback risk-free rate (%)", -99.0, 99.0, 4.0)) / 100, "Manual fallback"
+        return (
+            float(
+                st.sidebar.number_input("Fallback risk-free rate (%)", -99.0, 99.0, 4.0)
+            )
+            / 100,
+            "Manual fallback",
+            "Manually input risk-free rate (fallback)",
+        )
 
 
 def _manual_defaults(manual: bool, quote, expiry, chain) -> None:
@@ -401,6 +469,11 @@ def determine_manual_mode(spot_source: str, expiry: str | None, error: str | Non
     return spot_source == "Manual price" or expiry == MANUAL_MATURITY or error is not None
 
 
+def is_plausible_implied_volatility(volatility: float) -> bool:
+    """Apply a broad guard against Yahoo sentinel or malformed IV values."""
+    return MIN_PLAUSIBLE_IMPLIED_VOLATILITY <= volatility <= MAX_PLAUSIBLE_IMPLIED_VOLATILITY
+
+
 def _maturity(expiry: str) -> float:
     days = (date.fromisoformat(expiry) - datetime.now(UTC).date()).days
     if days <= 0:
@@ -411,47 +484,76 @@ def _maturity(expiry: str) -> float:
 def _results(result: PricingResult, inputs: DashboardInputs) -> None:
     st.subheader("Simulation results")
     st.caption("Results reflect the inputs captured when Generate simulation was pressed.")
-    core_columns = st.columns(3)
-    core_columns[0].metric("Estimated put value", f"{result.price:,.4f}")
-    core_columns[1].metric("Monte Carlo standard error", f"{result.standard_error:,.4f}")
     low, high = result.confidence_interval
-    core_columns[2].metric("Approximate 95% interval", f"[{low:,.4f}, {high:,.4f}]")
-
-    comparison_columns = st.columns(2)
     market = inputs.market_put_price
-    comparison_columns[0].metric(
-        "Market put value",
-        "N/A" if market is None else f"{market:,.4f}",
-        delta=None if market is None else f"Model − market: {result.price - market:+,.4f}",
-        delta_color="off",
-    )
+    known_facts, separator, simulation_metrics = st.columns([1, 0.04, 1])
+
+    with known_facts:
+        st.markdown("#### Known facts")
+        st.metric(
+            "Market put value",
+            "N/A" if market is None else f"{market:,.4f}",
+            delta=None if market is None else f"Model − market: {result.price - market:+,.4f}",
+            delta_color="off",
+        )
+        st.metric(inputs.volatility_label, f"{inputs.market.volatility:.2%}")
+        st.metric(inputs.risk_free_rate_label, f"{inputs.market.risk_free_rate:.2%}")
+
+    with separator:
+        st.markdown(
+            '<div style="border-left: 1px solid rgba(128, 128, 128, 0.45); '
+            'height: 25rem; margin: 0 auto;"></div>',
+            unsafe_allow_html=True,
+        )
+
+    with simulation_metrics:
+        st.markdown("#### Simulation metrics")
+        if inputs.exercise_style is ExerciseStyle.AMERICAN:
+            st.metric("Estimated American put value", f"{result.price:,.4f}")
+            st.metric(
+                "Estimated European put value",
+                f"{result.european_mc_price:,.4f}",
+                delta=f"American − European: {result.price - result.european_mc_price:+,.4f}",
+                delta_color="off",
+            )
+        else:
+            st.metric("Estimated European put value", f"{result.price:,.4f}")
+            if result.european_exact_price is not None:
+                st.metric(
+                    "Exact European put value",
+                    f"{result.european_exact_price:,.4f}",
+                    delta=(
+                        "MC − exact: "
+                        f"{result.european_mc_price - result.european_exact_price:+,.4f}"
+                    ),
+                    delta_color="off",
+                )
+            else:
+                st.metric("Exact European put value", "Not implemented for Heston")
+        st.metric("Monte Carlo standard error", f"{result.standard_error:,.4f}")
+        st.metric("Approximate 95% interval", f"[{low:,.4f}, {high:,.4f}]")
+
+    if not (result.discounted_realised_cash_flows > 0).any():
+        st.warning(
+            "No simulated path produced a positive option cash flow. This can occur "
+            "for a short-dated out-of-the-money put when volatility is very low; "
+            "check the maturity, strike and volatility inputs."
+        )
+
     if (
         inputs.exercise_style is ExerciseStyle.EUROPEAN
         and result.european_exact_price is not None
     ):
-        comparison_columns[1].metric(
-            "Black–Scholes exact value",
-            f"{result.european_exact_price:,.4f}",
-            delta=f"MC − exact: {result.european_mc_price - result.european_exact_price:+,.4f}",
-            delta_color="off",
-        )
         st.caption(
             "The European comparison validates terminal-payoff Monte Carlo against the "
             "closed-form Black–Scholes value under the same model inputs."
         )
     elif inputs.exercise_style is ExerciseStyle.EUROPEAN:
-        comparison_columns[1].metric("Heston benchmark", "Not implemented")
         st.caption(
             "The European Heston value is estimated by Monte Carlo; a semi-analytical "
             "Heston benchmark is not implemented in this application."
         )
     else:
-        comparison_columns[1].metric(
-            "European Monte Carlo value",
-            f"{result.european_mc_price:,.4f}",
-            delta=f"American − European: {result.price - result.european_mc_price:+,.4f}",
-            delta_color="off",
-        )
         st.caption(
             "The American–European difference is the estimated value added by the "
             "LSMC early-exercise feature under the same simulated paths."

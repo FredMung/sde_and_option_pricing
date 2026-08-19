@@ -2,7 +2,12 @@ from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
 
-from option_pricing_app.app.dashboard import DISCLAIMER, MANUAL_MATURITY, determine_manual_mode
+from option_pricing_app.app.dashboard import (
+    DISCLAIMER,
+    MANUAL_MATURITY,
+    determine_manual_mode,
+    is_plausible_implied_volatility,
+)
 
 
 def test_manual_mode_rule():
@@ -10,6 +15,12 @@ def test_manual_mode_rule():
     assert determine_manual_mode("Live ticker", MANUAL_MATURITY, None)
     assert determine_manual_mode("Live ticker", "2030-01-01", "network error")
     assert not determine_manual_mode("Live ticker", "2030-01-01", None)
+
+
+def test_implied_volatility_data_quality_range():
+    assert not is_plausible_implied_volatility(0.0078)
+    assert is_plausible_implied_volatility(0.20)
+    assert not is_plausible_implied_volatility(3.01)
 
 
 def test_app_starts_and_generates_manual_result():
@@ -40,11 +51,13 @@ def test_app_starts_and_generates_manual_result():
     app.run(timeout=30)
     assert not app.exception
     assert [metric.label for metric in app.metric] == [
-        "Estimated put value",
+        "Market put value",
+        "Manually input volatility",
+        "Manually input risk-free rate",
+        "Estimated European put value",
+        "Exact European put value",
         "Monte Carlo standard error",
         "Approximate 95% interval",
-        "Market put value",
-        "Black–Scholes exact value",
     ]
 
     next(widget for widget in app.selectbox if widget.label == "Exercise style").select(
@@ -54,11 +67,13 @@ def test_app_starts_and_generates_manual_result():
     app.run(timeout=30)
     assert not app.exception
     assert [metric.label for metric in app.metric] == [
-        "Estimated put value",
+        "Market put value",
+        "Manually input volatility",
+        "Manually input risk-free rate",
+        "Estimated American put value",
+        "Estimated European put value",
         "Monte Carlo standard error",
         "Approximate 95% interval",
-        "Market put value",
-        "European Monte Carlo value",
     ]
 
     next(widget for widget in app.selectbox if widget.label == "Asset-price model").select(
