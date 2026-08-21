@@ -8,6 +8,7 @@ from option_pricing_app.domain import (
     PRICE_BASIS_TERMS,
     ExerciseStyle,
     HestonInputs,
+    LSMCContinuationDiagnostic,
     MarketInputs,
     PricingResult,
     PutContract,
@@ -18,6 +19,8 @@ from option_pricing_app.stats import (
     HestonPriceSimulator,
     LSMCPriceSimulator,
 )
+
+CONTINUATION_GRID_SIZE = 300
 
 
 def create_asset_path_simulator(model: str):
@@ -79,6 +82,7 @@ def price_put(
         black_scholes_put_price(contract, market) if model == "GBM" else None
     )
 
+    lsmc = None
     if exercise_style is ExerciseStyle.EUROPEAN:
         pathwise_values = european_pathwise_values
         price = european_mc_price
@@ -109,6 +113,17 @@ def price_put(
     shown = min(config.max_display_paths, config.n_paths)
     terminal_prices = paths[-1].copy()
     time_grid = np.linspace(0.0, contract.maturity, config.n_steps + 1)
+    continuation_diagnostics = (
+        None
+        if lsmc is None
+        else _build_lsmc_continuation_diagnostics(
+            lsmc,
+            paths,
+            variance_paths,
+            contract,
+            time_grid,
+        )
+    )
     path_quantile_05, path_quantile_95 = np.quantile(paths, [0.05, 0.95], axis=1)
     if variance_paths is None:
         displayed_variance_paths = None
@@ -157,7 +172,138 @@ def price_put(
         convergence_lower=convergence_low,
         convergence_upper=convergence_high,
         exercise_percentages=exercise_percentages,
+        continuation_diagnostics=continuation_diagnostics,
     )
+
+
+def estimate_exercise_boundary(
+    price_grid: np.ndarray,
+    immediate_payoff: np.ndarray,
+    continuation_value: np.ndarray,
+    itm_path_count: int,
+    minimum_required_paths: int,
+) -> float:
+    """Return the economically meaningful exercise-to-continuation crossing.
+
+    A put boundary must separate a predominantly low-price exercise region from a
+    predominantly higher-price continuation region. If several polynomial crossings
+    exist, the candidate with the strongest agreement with that ordering is selected.
+    No value is returned outside the observed in-the-money price support.
+    """
+    prices = np.asarray(price_grid, dtype=float)
+    payoff = np.asarray(immediate_payoff, dtype=float)
+    continuation = np.asarray(continuation_value, dtype=float)
+    if (
+        itm_path_count < minimum_required_paths
+        or prices.ndim != 1
+        or prices.size < 2
+        or payoff.shape != prices.shape
+        or continuation.shape != prices.shape
+    ):
+        return float("nan")
+
+    finite = np.isfinite(prices) & np.isfinite(payoff) & np.isfinite(continuation)
+    prices = prices[finite]
+    difference = (payoff - continuation)[finite]
+    if prices.size < 2 or np.ptp(prices) <= np.finfo(float).eps:
+        return float("nan")
+
+    scale = max(
+        1.0,
+        float(np.max(np.abs(payoff[finite]))),
+        float(np.max(np.abs(continuation[finite]))),
+    )
+    tolerance = 1e-8 * scale
+    if np.all(np.abs(difference) <= tolerance):
+        return float("nan")
+
+    candidates = []
+    for index in range(prices.size - 1):
+        if difference[index] > tolerance and difference[index + 1] <= tolerance:
+            low_price_exercise = float(np.mean(difference[: index + 1] > tolerance))
+            high_price_continue = float(np.mean(difference[index + 1 :] <= tolerance))
+            if low_price_exercise >= 0.60 and high_price_continue >= 0.60:
+                score = (
+                    min(low_price_exercise, high_price_continue),
+                    low_price_exercise + high_price_continue,
+                    -index,
+                )
+                candidates.append((score, index))
+
+    if not candidates:
+        return float("nan")
+    _, index = max(candidates)
+    x0, x1 = prices[index], prices[index + 1]
+    d0, d1 = difference[index], difference[index + 1]
+    if np.isclose(d0, d1):
+        return float((x0 + x1) / 2.0)
+    return float(x0 - d0 * (x1 - x0) / (d1 - d0))
+
+
+def _build_lsmc_continuation_diagnostics(
+    lsmc: LSMCPriceSimulator,
+    price_paths: np.ndarray,
+    variance_paths: np.ndarray | None,
+    contract: PutContract,
+    time_grid: np.ndarray,
+) -> tuple[LSMCContinuationDiagnostic, ...]:
+    """Evaluate stored LSMC regressions on their observed in-the-money support."""
+    diagnostics = []
+    for timestep, model in sorted(lsmc.continuation_models.items()):
+        # This is the same cross-sectional population used to fit the LSMC model:
+        # out-of-the-money paths have no immediate exercise decision and are excluded.
+        in_the_money = price_paths[timestep] < contract.strike
+        itm_prices = price_paths[timestep, in_the_money]
+        if itm_prices.size < 2 or np.ptp(itm_prices) <= np.finfo(float).eps:
+            continue
+
+        price_grid = np.linspace(
+            float(np.min(itm_prices)),
+            float(np.max(itm_prices)),
+            CONTINUATION_GRID_SIZE,
+        )
+        representative_variance = None
+        grid_variances = None
+        if model.uses_variance:
+            if variance_paths is None:
+                continue
+            # Heston continuation is C(S, v), so the one-dimensional chart is an
+            # explicit conditional slice at the median variance of the ITM paths.
+            representative_variance = float(
+                np.median(variance_paths[timestep, in_the_money])
+            )
+            grid_variances = np.full_like(price_grid, representative_variance)
+
+        continuation_value = np.asarray(
+            model.predict(price_grid, grid_variances), dtype=float
+        )
+        if not np.all(np.isfinite(continuation_value)):
+            continue
+        immediate_payoff = np.maximum(contract.strike - price_grid, 0.0)
+        minimum_required_paths = max(10, 2 * len(model.basis_terms))
+        boundary = estimate_exercise_boundary(
+            price_grid,
+            immediate_payoff,
+            continuation_value,
+            int(itm_prices.size),
+            minimum_required_paths,
+        )
+        diagnostics.append(
+            LSMCContinuationDiagnostic(
+                timestep=timestep,
+                time=float(time_grid[timestep]),
+                time_to_maturity=float(contract.maturity - time_grid[timestep]),
+                itm_path_count=int(itm_prices.size),
+                minimum_required_paths=minimum_required_paths,
+                basis_terms=model.basis_terms,
+                price_grid=price_grid,
+                immediate_payoff=immediate_payoff,
+                continuation_value=continuation_value,
+                boundary=boundary,
+                representative_variance=representative_variance,
+            )
+        )
+    return tuple(diagnostics)
 
 
 def black_scholes_put_price(contract: PutContract, market: MarketInputs) -> float:

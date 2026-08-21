@@ -59,6 +59,7 @@ def test_app_starts_and_generates_manual_result():
         "Monte Carlo standard error",
         "Approximate 95% interval",
     ]
+    assert next(metric for metric in app.metric if metric.label == "Market put value").delta == ""
 
     next(widget for widget in app.selectbox if widget.label == "Exercise style").select(
         "American"
@@ -75,6 +76,18 @@ def test_app_starts_and_generates_manual_result():
         "Monte Carlo standard error",
         "Approximate 95% interval",
     ]
+    assert (
+        next(
+            metric
+            for metric in app.metric
+            if metric.label == "Estimated European put value"
+        ).delta
+        == ""
+    )
+    assert not any(
+        widget.label == "Exercise timestep for continuation diagnostic"
+        for widget in app.selectbox
+    )
 
     next(widget for widget in app.selectbox if widget.label == "Asset-price model").select(
         "Heston"

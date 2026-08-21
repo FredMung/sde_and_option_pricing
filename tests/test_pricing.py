@@ -9,7 +9,10 @@ from option_pricing_app import (
     SimulationConfig,
     price_put,
 )
-from option_pricing_app.service import black_scholes_put_price
+from option_pricing_app.service import (
+    black_scholes_put_price,
+    estimate_exercise_boundary,
+)
 from option_pricing_app.stats import (
     GBMPriceSimulator,
     HestonPriceSimulator,
@@ -82,8 +85,14 @@ def test_service_prices_both_exercise_styles(style):
     if style is ExerciseStyle.AMERICAN:
         assert result.exercise_percentages.shape == (26,)
         assert 0 <= result.exercise_percentages.sum() <= 100
+        assert result.continuation_diagnostics
+        assert all(
+            diagnostic.price_grid.shape == (300,)
+            for diagnostic in result.continuation_diagnostics
+        )
     else:
         assert result.exercise_percentages is None
+        assert result.continuation_diagnostics is None
 
 
 def test_lsmc_handles_no_in_the_money_paths():
@@ -110,6 +119,41 @@ def test_lsmc_builds_quadratic_price_variance_cross_terms():
     )
 
 
+def test_stored_continuation_model_reproduces_fitted_values():
+    simulator = LSMCPriceSimulator()
+    prices = np.array([80.0, 85.0, 90.0, 95.0])
+    future_cash_flows = np.array([19.0, 14.0, 9.0, 4.0])
+    fitted = simulator.estimate_continuation_value(
+        prices, future_cash_flows, 0.05, 0.25
+    )
+    model = simulator.fit_continuation_model(
+        prices, future_cash_flows, 0.05, 0.25, timestep=2
+    )
+    np.testing.assert_allclose(model.predict(prices), fitted)
+    assert model.timestep == 2
+    assert model.basis_terms == ("1", "S", "S²")
+
+
+def test_boundary_uses_low_price_exercise_to_high_price_continuation_crossing():
+    prices = np.linspace(0.0, 10.0, 1_001)
+    payoff = 10.0 - prices
+    difference = -(prices - 2.0) * (prices - 4.0) * (prices - 6.0)
+    continuation = payoff - difference
+    boundary = estimate_exercise_boundary(prices, payoff, continuation, 1_000, 10)
+    assert boundary == pytest.approx(2.0, abs=0.02)
+
+
+def test_boundary_is_missing_when_crossing_is_unsupported_or_sample_is_small():
+    prices = np.linspace(60.0, 99.0, 300)
+    payoff = 100.0 - prices
+    assert np.isnan(
+        estimate_exercise_boundary(prices, payoff, np.zeros_like(prices), 1_000, 10)
+    )
+    assert np.isnan(
+        estimate_exercise_boundary(prices, payoff, np.full_like(prices, 10.0), 5, 10)
+    )
+
+
 @pytest.mark.parametrize("style", list(ExerciseStyle))
 def test_service_prices_heston_and_returns_variance_diagnostics(style):
     result = price_put(
@@ -133,6 +177,12 @@ def test_service_prices_heston_and_returns_variance_diagnostics(style):
     assert result.variance_quantile_95.shape == (21,)
     assert result.expected_variance_path.shape == (21,)
     assert result.long_run_variance == pytest.approx(0.04)
+    if style is ExerciseStyle.AMERICAN:
+        assert result.continuation_diagnostics
+        assert all(
+            diagnostic.representative_variance is not None
+            for diagnostic in result.continuation_diagnostics
+        )
 
 
 def test_gbm_rejects_variance_basis_terms():

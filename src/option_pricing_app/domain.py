@@ -103,6 +103,23 @@ class SimulationConfig:
 
 
 @dataclass(frozen=True)
+class LSMCContinuationDiagnostic:
+    """Chart-ready slice of one fitted LSMC continuation regression."""
+
+    timestep: int
+    time: float
+    time_to_maturity: float
+    itm_path_count: int
+    minimum_required_paths: int
+    basis_terms: tuple[str, ...]
+    price_grid: np.ndarray
+    immediate_payoff: np.ndarray
+    continuation_value: np.ndarray
+    boundary: float
+    representative_variance: float | None
+
+
+@dataclass(frozen=True)
 class PricingResult:
     price: float
     standard_error: float
@@ -131,6 +148,7 @@ class PricingResult:
     convergence_lower: np.ndarray
     convergence_upper: np.ndarray
     exercise_percentages: np.ndarray | None
+    continuation_diagnostics: tuple[LSMCContinuationDiagnostic, ...] | None
 
 
 def _positive(name: str, value: float) -> None:

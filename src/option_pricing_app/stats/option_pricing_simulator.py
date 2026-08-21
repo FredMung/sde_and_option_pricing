@@ -1,5 +1,7 @@
 """Option-pricing simulators and configurable LSMC regression machinery."""
 
+from dataclasses import dataclass
+
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -20,6 +22,28 @@ BASIS_TERM_EXPONENTS = {
 }
 
 
+@dataclass(frozen=True)
+class ContinuationRegression:
+    """Scaled least-squares continuation model fitted at one exercise timestep."""
+
+    timestep: int
+    basis_terms: tuple[str, ...]
+    coefficients: np.ndarray
+    column_scales: np.ndarray
+
+    @property
+    def uses_variance(self):
+        """Return whether prediction requires the Heston variance state."""
+        return any(BASIS_TERM_EXPONENTS[term][1] for term in self.basis_terms)
+
+    def predict(self, prices, variances=None):
+        """Evaluate the fitted cross-sectional regression without refitting it."""
+        design_matrix = LSMCPriceSimulator.build_design_matrix(
+            prices, self.basis_terms, variances
+        )
+        return (design_matrix / self.column_scales) @ self.coefficients
+
+
 class LSMCPriceSimulator:
     def __init__(self, price_path_simulator=None):
         """Initialise LSMC with a configurable price-path simulator."""
@@ -27,6 +51,7 @@ class LSMCPriceSimulator:
         self.price_path_simulator = price_path_simulator or GBMPriceSimulator()
         self.option_value_paths = None
         self.exercise_steps = None
+        self.continuation_models = {}
 
     def generate_price_paths(self, *args, **kwargs):
         """Generate paths on the exercise-time grid used by LSMC."""
@@ -60,6 +85,28 @@ class LSMCPriceSimulator:
         variances=None,
     ):
         """Estimate continuation values from discounted future cash flows."""
+        model = self.fit_continuation_model(
+            prices,
+            future_cash_flows,
+            r,
+            dt,
+            basis_terms,
+            variances,
+            timestep=-1,
+        )
+        return model.predict(prices, variances)
+
+    def fit_continuation_model(
+        self,
+        prices,
+        future_cash_flows,
+        r,
+        dt,
+        basis_terms=None,
+        variances=None,
+        timestep=-1,
+    ):
+        """Fit and return the scaled regression used by the stopping decision."""
         terms = tuple(basis_terms or PRICE_BASIS_TERMS)
         design_matrix = self.build_design_matrix(prices, terms, variances)
         # Column scaling leaves the polynomial span unchanged and improves the
@@ -69,8 +116,12 @@ class LSMCPriceSimulator:
         scaled_design = design_matrix / column_scales
         regression_target = np.exp(-r * dt) * future_cash_flows
         coefficients = np.linalg.lstsq(scaled_design, regression_target, rcond=None)[0]
-
-        return scaled_design @ coefficients
+        return ContinuationRegression(
+            timestep=timestep,
+            basis_terms=terms,
+            coefficients=coefficients.copy(),
+            column_scales=column_scales.copy(),
+        )
 
     @staticmethod
     def build_design_matrix(prices, basis_terms, variances=None):
@@ -106,6 +157,7 @@ class LSMCPriceSimulator:
         discount_factor = np.exp(-r * dt)
         if variance_paths is not None and variance_paths.shape != price_paths.shape:
             raise ValueError("variance_paths must have the same shape as price_paths")
+        self.continuation_models = {}
         
         # Calculate max(K-S_T, 0) for each path at maturity.
         cash_flows = self.calculate_payoff(price_paths[-1], K)
@@ -130,12 +182,18 @@ class LSMCPriceSimulator:
             if np.any(in_the_money):
                 # Estimate continuation value using regression.
                 # Out-of-the-money paths are excluded from the regression.
-                continuation_value = self.estimate_continuation_value(
+                continuation_model = self.fit_continuation_model(
                     price_paths[t, in_the_money],
                     cash_flows[in_the_money],
                     r,
                     dt,
                     basis_terms,
+                    None if variance_paths is None else variance_paths[t, in_the_money],
+                    timestep=t,
+                )
+                self.continuation_models[t] = continuation_model
+                continuation_value = continuation_model.predict(
+                    price_paths[t, in_the_money],
                     None if variance_paths is None else variance_paths[t, in_the_money],
                 )
 

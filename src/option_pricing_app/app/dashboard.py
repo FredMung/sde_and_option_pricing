@@ -9,6 +9,7 @@ import streamlit as st
 from option_pricing_app.app.charts import (
     cash_flow_figure,
     convergence_figure,
+    exercise_boundary_figure,
     exercise_figure,
     paths_figure,
     payoff_figure,
@@ -493,8 +494,6 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
         st.metric(
             "Market put value",
             "N/A" if market is None else f"{market:,.4f}",
-            delta=None if market is None else f"Model − market: {result.price - market:+,.4f}",
-            delta_color="off",
         )
         st.metric(inputs.volatility_label, f"{inputs.market.volatility:.2%}")
         st.metric(inputs.risk_free_rate_label, f"{inputs.market.risk_free_rate:.2%}")
@@ -513,8 +512,6 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
             st.metric(
                 "Estimated European put value",
                 f"{result.european_mc_price:,.4f}",
-                delta=f"American − European: {result.price - result.european_mc_price:+,.4f}",
-                delta_color="off",
             )
         else:
             st.metric("Estimated European put value", f"{result.price:,.4f}")
@@ -564,15 +561,6 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
         "The line is the cumulative mean of discounted pathwise payoffs; the band is "
         "the approximate 95% Monte Carlo confidence interval at each path count."
     )
-    if result.exercise_percentages is not None:
-        st.plotly_chart(exercise_figure(result), use_container_width=True)
-        st.caption(
-            "Each path is counted once at its earliest selected exercise time; paths "
-            "that expire out of the money are not counted. Being in the money does "
-            "not automatically trigger exercise because continuation may be more "
-            "valuable. These percentages are risk-neutral model estimates, not a "
-            "forecast of how many investors will exercise."
-        )
     st.plotly_chart(paths_figure(result, inputs.contract), use_container_width=True)
     st.caption(
         "The shaded area contains the central 90% of simulated asset prices at each "
@@ -587,6 +575,42 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
     left, right = st.columns(2)
     left.plotly_chart(terminal_figure(result, inputs.contract), use_container_width=True)
     right.plotly_chart(payoff_figure(result, inputs.contract), use_container_width=True)
+    if result.exercise_percentages is not None:
+        st.plotly_chart(exercise_figure(result), use_container_width=True)
+        st.caption(
+            "Each path is counted once at its earliest selected exercise time; paths "
+            "that expire out of the money are not counted. Being in the money does "
+            "not automatically trigger exercise because continuation may be more "
+            "valuable. These percentages are risk-neutral model estimates, not a "
+            "forecast of how many investors will exercise."
+        )
+    if result.continuation_diagnostics:
+        st.plotly_chart(
+            exercise_boundary_figure(result, inputs.contract),
+            use_container_width=True,
+        )
+        boundary_caption = (
+            "Each point is obtained by solving immediate payoff = fitted continuation "
+            "value on that timestep's observed in-the-money price range. Missing "
+            "timesteps had too few observations or no economically ordered crossing; "
+            "no boundary is extrapolated. The line is unsmoothed and can therefore be "
+            "noisy, particularly near maturity."
+        )
+        if any(
+            diagnostic.representative_variance is not None
+            for diagnostic in result.continuation_diagnostics
+        ):
+            boundary_caption += (
+                " Because Heston continuation depends on both price and variance, each "
+                "displayed boundary is conditional on that timestep's median "
+                "in-the-money variance."
+            )
+        st.caption(boundary_caption)
+    elif result.continuation_diagnostics == ():
+        st.info(
+            "No LSMC continuation regression could be visualised. Increase the number "
+            "of time steps or choose a contract with in-the-money simulated paths."
+        )
     st.plotly_chart(cash_flow_figure(result), use_container_width=True)
     if result.exercise_style is ExerciseStyle.AMERICAN:
         st.caption(
@@ -639,11 +663,81 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
 
 def _methodology() -> None:
     with st.expander("Methodology and interpretation"):
+        st.markdown("#### Model setting")
+        st.markdown(
+            """
+            Valuation is performed under the risk-neutral measure, not the physical
+            or real-world measure. The underlying is assumed to be a single
+            non-dividend-paying stock in an arbitrage-free, frictionless market with
+            a constant continuously compounded risk-free rate. The simulated paths
+            are pricing inputs and should not be interpreted as forecasts of future
+            stock returns.
+            """
+        )
+
         st.markdown("**GBM under the risk-neutral measure**")
         st.latex(
             r"S_{t+\Delta t}=S_t\exp\left[(r-\tfrac12\sigma^2)\Delta t"
             r"+\sigma\sqrt{\Delta t}Z\right],\quad Z\sim N(0,1)"
         )
+        st.markdown(
+            r"""
+            With constant volatility and interest rates, this exponential recursion
+            is the exact GBM transition between selected grid points and preserves
+            positive prices. More time steps therefore do not improve a European
+            option's terminal GBM distribution; they matter for an American option
+            because they provide a finer set of possible exercise dates.
+            """
+        )
+
+        st.markdown("**European put valuation and Monte Carlo uncertainty**")
+        st.latex(
+            r"P_0^E=e^{-rT}\mathbb{E}^{\mathbb{Q}}[(K-S_T)^+],\qquad "
+            r"\widehat P_{0,n}^E=\frac1n\sum_{i=1}^{n}"
+            r"e^{-rT}(K-S_T^{(i)})^+"
+        )
+        st.latex(
+            r"\widehat{\operatorname{SE}}(\widehat P_{0,n})="
+            r"\frac{s_X}{\sqrt n},\qquad "
+            r"\text{approximate 95\% interval}="
+            r"\widehat P_{0,n}\pm1.96\widehat{\operatorname{SE}}(\widehat P_{0,n})"
+        )
+        st.markdown(
+            r"""
+            The standard error decreases at rate \(n^{-1/2}\), so halving it requires
+            approximately four times as many independent paths. For GBM, the exact
+            no-dividend Black–Scholes put value evaluates the same risk-neutral payoff
+            analytically and is used only to validate the European Monte Carlo
+            implementation. Agreement with Black–Scholes does not establish agreement
+            with an observed market price.
+            """
+        )
+
+        st.markdown("**American put valuation with LSMC**")
+        st.latex(
+            r"H_j(s)=(K-s)^+,\qquad C_j(s)="
+            r"\mathbb{E}^{\mathbb{Q}}[e^{-r\Delta t}V_{j+1}(S_{t_{j+1}})"
+            r"\mid S_{t_j}=s]"
+        )
+        st.latex(
+            r"Y_i^{(j)}=e^{-r\Delta t}F_i^{(j+1)},\qquad "
+            r"Y_i^{(j)}\approx\sum_k\beta_k^{(j)}\phi_k(S_{t_j}^{(i)})"
+        )
+        st.markdown(
+            r"""
+            LSMC starts from the terminal put payoff and works backwards through the
+            exercise grid. At each date it fits the discounted future cash flows using
+            only in-the-money paths, then exercises when immediate value exceeds the
+            fitted continuation value. The default GBM basis is \(1,S,S^2\). The app
+            also allows selected variance and price–variance terms when Heston is used.
+            After the final backward step, pathwise cash flows are discounted to time
+            zero and averaged; immediate exercise at time zero is retained when it is
+            more valuable. The theoretical early-exercise right implies
+            \(P_0^A\geq P_0^E\), although a finite-sample LSMC estimate can be affected
+            by regression and sampling error.
+            """
+        )
+
         st.markdown("**Heston stochastic variance under the risk-neutral measure**")
         st.latex(
             r"dS_t=rS_tdt+\sqrt{v_t}S_tdW_t^S,\qquad "
@@ -651,24 +745,55 @@ def _methodology() -> None:
             r"dW_t^S dW_t^v=\rho dt"
         )
         st.markdown(
+            r"""
+            Here \(v_t\) is instantaneous variance, \(\kappa\) is its mean-reversion
+            speed, \(\theta\) its long-run mean, \(\xi\) the volatility of variance,
+            and \(\rho\) the price–variance correlation. Following the dissertation's
+            simplified risk-neutral specification, the variance-risk premium is set to
+            zero, so the physical and risk-neutral variance parameters are not separated.
+            This assumption does not make the two measures identical: the stock drift
+            still changes from the physical expected return to \(r\).
             """
-            A European put is the average discounted terminal payoff. For an
-            American put, LSMC works backwards through possible exercise dates,
-            estimates continuation values by regression, and compares continuation
-            with immediate exercise. Under Heston, continuation regression may
-            include price, variance, their squares, and selected cross-products.
-            The exact European reference is shown only for GBM and uses the
-            no-dividend Black–Scholes put formula with the same model inputs.
+        )
+        st.latex(
+            r"v_t^+=\max(v_t,0),\quad \widetilde v_{t+\Delta t}="
+            r"v_t^++\kappa(\theta-v_t^+)\Delta t+\xi\sqrt{v_t^+\Delta t}Z_v"
+        )
+        st.latex(
+            r"v_{t+\Delta t}=\max(\widetilde v_{t+\Delta t},0),\qquad "
+            r"S_{t+\Delta t}=S_t\exp\left[(r-\tfrac12v_t^+)\Delta t"
+            r"+\sqrt{v_t^+\Delta t}Z_S\right]"
+        )
+        st.latex(
+            r"Z_S=\rho Z_v+\sqrt{1-\rho^2}Z_\perp,\qquad "
+            r"Z_v,Z_\perp\sim N(0,1)"
+        )
+        st.markdown(
+            """
+            The variance equation uses a non-negative full-truncation Euler step,
+            while the asset price uses an exponential log-Euler step. Unlike the exact
+            GBM transition, Heston simulation has time-discretisation error, so a finer
+            grid should more closely approximate the continuous-time processes. The
+            Feller condition concerns strict positivity of the continuous variance
+            process; truncation prevents negative simulated variance when that condition
+            is not satisfied. Market volatility supplies initial Heston defaults rather
+            than a calibration of all Heston parameters to an option surface.
+            """
+        )
 
-            Heston variance is simulated with a non-negative full-truncation
-            Euler step, while the asset uses an exponential log-Euler step. The
-            market volatility supplies initial defaults rather than a calibrated
-            Heston parameter set.
-
-            The interval shown measures Monte Carlo sampling uncertainty only. It
-            excludes model risk, dividends, volatility-surface effects, transaction
-            costs, liquidity, and calibration error. Yahoo quotes may be delayed;
-            the displayed midpoint falls back to the last trade when a valid bid
-            and ask are unavailable.
+        st.markdown("**Interpreting the results**")
+        st.markdown(
+            """
+            - Increasing paths primarily reduces Monte Carlo sampling uncertainty.
+            - Increasing exercise steps refines the American stopping opportunity;
+              under Heston it also reduces time-discretisation error.
+            - The displayed confidence interval measures Monte Carlo sampling
+              uncertainty only. It does not include LSMC regression uncertainty,
+              model risk or parameter uncertainty.
+            - Model–market differences may reflect the no-dividend and frictionless-
+              market assumptions, volatility-surface effects, Heston calibration,
+              jumps, liquidity, transaction costs, delayed quotes and bid–ask effects.
+            - Yahoo's bid–ask midpoint falls back to the last traded price when a valid
+              bid and ask are unavailable.
             """
         )
