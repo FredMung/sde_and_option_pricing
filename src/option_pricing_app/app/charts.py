@@ -9,6 +9,12 @@ from option_pricing_app.domain import (
     PricingResult,
     PutContract,
 )
+from option_pricing_app.numerical_studies import (
+    BasisSensitivityStudyResult,
+    ExerciseGridStudyResult,
+    ExperimentPoint,
+    PathCountStudyResult,
+)
 
 PRIMARY_BLUE = "#5B9BD5"
 BLUE_PATH = "rgba(91, 155, 213, 0.28)"
@@ -266,7 +272,7 @@ def cash_flow_figure(result: PricingResult) -> go.Figure:
 
 
 def convergence_figure(result: PricingResult) -> go.Figure:
-    """Plot the cumulative Monte Carlo estimate and its approximate 95% interval."""
+    """Plot a cumulative diagnostic from one completed simulation."""
     figure = go.Figure()
     figure.add_trace(
         go.Scatter(
@@ -312,7 +318,7 @@ def convergence_figure(result: PricingResult) -> go.Figure:
             annotation_text="Black–Scholes exact",
         )
     figure.update_layout(
-        title="Monte Carlo convergence by simulated path",
+        title="Single-run cumulative estimate",
         xaxis_title="Number of paths included",
         yaxis_title="Estimated option value",
         template="plotly_white",
@@ -320,6 +326,137 @@ def convergence_figure(result: PricingResult) -> go.Figure:
         hovermode="x unified",
     )
     return figure
+
+
+def _repeated_study_figure(
+    points: tuple[ExperimentPoint, ...],
+    title: str,
+    xaxis_title: str,
+    *,
+    categorical: bool = False,
+) -> go.Figure:
+    """Plot repeated full-pricing estimates and empirical replication quantiles."""
+    x_values = [point.setting_label if categorical else point.setting_value for point in points]
+    lower = np.asarray([point.lower_empirical_quantile for point in points])
+    upper = np.asarray([point.upper_empirical_quantile for point in points])
+    means = np.asarray([point.mean_estimate for point in points])
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=x_values,
+            y=upper,
+            mode="lines",
+            line={"width": 0},
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=x_values,
+            y=lower,
+            mode="lines",
+            line={"width": 0},
+            fill="tonexty",
+            fillcolor=BLUE_BAND,
+            name="95% empirical replication interval",
+            customdata=upper,
+            hovertemplate=(
+                "Setting=%{x}<br>2.5%=%{y:.4f}<br>97.5%=%{customdata:.4f}"
+                "<extra></extra>"
+            ),
+        )
+    )
+    run_x = []
+    run_y = []
+    run_seed = []
+    for x_value, point in zip(x_values, points, strict=True):
+        for run in point.runs:
+            run_x.append(x_value)
+            run_y.append(run.estimated_price)
+            run_seed.append(run.seed)
+    figure.add_trace(
+        go.Scatter(
+            x=run_x,
+            y=run_y,
+            mode="markers",
+            marker={"size": 6, "color": PRIMARY_BLUE, "opacity": 0.28},
+            name="Individual replication",
+            customdata=run_seed,
+            hovertemplate=(
+                "Setting=%{x}<br>Estimate=%{y:.4f}<br>Seed=%{customdata}"
+                "<extra></extra>"
+            ),
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=x_values,
+            y=means,
+            mode="lines+markers",
+            line={"width": 3, "color": PRIMARY_BLUE},
+            marker={"size": 8, "color": PRIMARY_BLUE},
+            name="Mean across replications",
+            hovertemplate="Setting=%{x}<br>Mean=%{y:.4f}<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        title=title,
+        xaxis_title=xaxis_title,
+        yaxis_title="Estimated American put value",
+        template="plotly_white",
+        height=430,
+        hovermode="x unified",
+    )
+    return figure
+
+
+def path_count_study_figure(study: PathCountStudyResult) -> go.Figure:
+    """Plot true LSMC path-count convergence from complete repeated reruns."""
+    figure = _repeated_study_figure(
+        study.points,
+        "Path-count convergence study",
+        "Number of paths used to fit and value LSMC",
+    )
+    final = study.points[-1]
+    figure.add_trace(
+        go.Scatter(
+            x=[final.setting_value],
+            y=[final.mean_estimate],
+            mode="markers",
+            marker={"size": 13, "symbol": "diamond", "color": REFERENCE_RED},
+            name="Selected path count",
+            hovertemplate="Selected paths=%{x:,}<br>Mean=%{y:.4f}<extra></extra>",
+        )
+    )
+    if study.european_reference is not None:
+        figure.add_hline(
+            y=study.european_reference,
+            line_dash="dash",
+            line_color=CONTINUATION_ORANGE,
+            line_width=3,
+            annotation_text="European Black–Scholes value",
+        )
+    return figure
+
+
+def exercise_grid_study_figure(study: ExerciseGridStudyResult) -> go.Figure:
+    """Plot repeated American estimates as the permitted exercise grid is refined."""
+    return _repeated_study_figure(
+        study.points,
+        "Exercise-grid convergence study",
+        "Number of exercise dates",
+    )
+
+
+def basis_sensitivity_study_figure(study: BasisSensitivityStudyResult) -> go.Figure:
+    """Plot repeated American estimates across documented LSMC basis choices."""
+    return _repeated_study_figure(
+        study.points,
+        "LSMC basis-function sensitivity",
+        "Basis specification",
+        categorical=True,
+    )
 
 
 def exercise_figure(result: PricingResult) -> go.Figure:

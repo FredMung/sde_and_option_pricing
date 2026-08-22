@@ -7,10 +7,13 @@ import pandas as pd
 import streamlit as st
 
 from option_pricing_app.app.charts import (
+    basis_sensitivity_study_figure,
     cash_flow_figure,
     convergence_figure,
     exercise_boundary_figure,
     exercise_figure,
+    exercise_grid_study_figure,
+    path_count_study_figure,
     paths_figure,
     payoff_figure,
     terminal_figure,
@@ -34,6 +37,15 @@ from option_pricing_app.market_data import (
     TreasuryCurve,
     YahooFinanceClient,
 )
+from option_pricing_app.numerical_studies import (
+    NumericalStudiesResult,
+    estimate_workload,
+    generate_base_seed,
+    make_exercise_grid,
+    make_path_count_grid,
+    run_numerical_studies,
+    studies_to_csv,
+)
 from option_pricing_app.service import price_put
 
 DISCLAIMER = (
@@ -44,6 +56,7 @@ DISCLAIMER = (
 MANUAL_MATURITY = "Manual maturity"
 MIN_PLAUSIBLE_IMPLIED_VOLATILITY = 0.05
 MAX_PLAUSIBLE_IMPLIED_VOLATILITY = 3.00
+MAX_HOSTED_STUDY_PATH_STEPS = 100_000_000
 
 
 @dataclass(frozen=True)
@@ -86,6 +99,28 @@ def cached_treasury_curve() -> TreasuryCurve:
     return TreasuryClient().get_latest_curve()
 
 
+@st.cache_data(show_spinner=False)
+def cached_numerical_studies(
+    contract: PutContract,
+    market: MarketInputs,
+    config: SimulationConfig,
+    model: str,
+    heston_inputs: HestonInputs | None,
+    base_seed: int,
+    replications: int,
+) -> NumericalStudiesResult:
+    """Cache complete repeated-run studies for an identical numerical specification."""
+    return run_numerical_studies(
+        contract,
+        market,
+        config,
+        model,
+        heston_inputs,
+        base_seed,
+        replications,
+    )
+
+
 def run_dashboard() -> None:
     st.set_page_config(page_title="SDE Option-Pricing Lab", page_icon="📈", layout="wide")
     st.title("SDE Option-Pricing Lab")
@@ -107,12 +142,14 @@ def run_dashboard() -> None:
                     inputs.heston_inputs,
                 )
             st.session_state["pricing_output"] = (result, inputs)
+            st.session_state.pop("numerical_studies_output", None)
         except (ValueError, FloatingPointError) as exc:
             st.error(f"The simulation could not be completed: {exc}")
 
     output = st.session_state.get("pricing_output")
     if output:
         _results(*output)
+        _numerical_studies(output[1])
     else:
         st.info("Choose assumptions in the sidebar, then generate a simulation.")
     _methodology()
@@ -556,11 +593,14 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
             "LSMC early-exercise feature under the same simulated paths."
         )
     st.caption(f"Market reference: {inputs.market_put_price_source}")
-    st.plotly_chart(convergence_figure(result), use_container_width=True)
-    st.caption(
-        "The line is the cumulative mean of discounted pathwise payoffs; the band is "
-        "the approximate 95% Monte Carlo confidence interval at each path count."
-    )
+    with st.expander("Single-run cumulative estimate", expanded=False):
+        st.plotly_chart(convergence_figure(result), use_container_width=True)
+        st.caption(
+            "The line successively includes discounted cash flows from one completed "
+            "simulation. For an American option, every point uses the stopping policy "
+            "fitted with the full path pool, so this is not a path-count convergence "
+            "study."
+        )
     st.plotly_chart(paths_figure(result, inputs.contract), use_container_width=True)
     st.caption(
         "The shaded area contains the central 90% of simulated asset prices at each "
@@ -659,6 +699,142 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
         )
     st.subheader("Inputs and provenance")
     st.dataframe(pd.DataFrame(rows, columns=["Input", "Value or source"]), hide_index=True, use_container_width=True)
+
+
+def _numerical_studies(inputs: DashboardInputs) -> None:
+    """Render separately triggered repeated-run convergence and sensitivity studies."""
+    st.divider()
+    st.subheader("Numerical studies")
+    if inputs.exercise_style is not ExerciseStyle.AMERICAN:
+        st.info("Numerical LSMC studies are available when the exercise style is American.")
+        return
+
+    replications = int(
+        st.number_input(
+            "Number of replications",
+            min_value=3,
+            max_value=20,
+            value=5,
+            step=1,
+            help="Each setting is fully simulated and refitted once per replication seed.",
+        )
+    )
+    pricing_runs, path_steps = estimate_workload(
+        inputs.simulation, inputs.model, replications
+    )
+    path_grid = make_path_count_grid(inputs.simulation.n_paths)
+    exercise_grid = (
+        make_exercise_grid(inputs.simulation.n_steps) if inputs.model == "GBM" else ()
+    )
+    st.caption(
+        f"Estimated workload: {pricing_runs:,} complete pricing runs and "
+        f"approximately {path_steps:,} simulated path-steps. Runs are sequential and "
+        "only scalar results are retained."
+    )
+    if len(path_grid) < 3:
+        st.warning(
+            "The selected maximum forms fewer than three path-count settings. Increase "
+            "the number of paths for a more informative convergence study."
+        )
+    if inputs.model == "GBM" and len(exercise_grid) < 3:
+        st.warning(
+            "The selected maximum forms fewer than three exercise-grid settings. "
+            "Increase the number of time steps for a more informative grid study."
+        )
+    if inputs.model == "Heston":
+        st.info(
+            "The exercise-grid study is disabled for Heston: changing the number of "
+            "steps changes both the permitted exercise dates and the numerical "
+            "discretisation of the Heston SDEs."
+        )
+
+    too_expensive = path_steps > MAX_HOSTED_STUDY_PATH_STEPS
+    if too_expensive:
+        st.warning(
+            "This requested study is too expensive for the hosted-app workload limit. "
+            "Reduce paths, time steps, basis complexity, or replications; the requested "
+            "settings have not been changed automatically."
+        )
+    if st.button(
+        "Run numerical studies",
+        type="primary",
+        disabled=too_expensive,
+        use_container_width=True,
+    ):
+        base_seed = (
+            inputs.simulation.seed
+            if inputs.simulation.seed is not None
+            else generate_base_seed()
+        )
+        try:
+            with st.spinner("Running repeated simulations and LSMC fits..."):
+                result = cached_numerical_studies(
+                    inputs.contract,
+                    inputs.market,
+                    inputs.simulation,
+                    inputs.model,
+                    inputs.heston_inputs,
+                    base_seed,
+                    replications,
+                )
+            st.session_state["numerical_studies_output"] = result
+        except (ValueError, FloatingPointError) as exc:
+            st.error(f"The numerical studies could not be completed: {exc}")
+
+    studies = st.session_state.get("numerical_studies_output")
+    if not studies:
+        return
+    _render_numerical_studies(studies)
+
+
+def _render_numerical_studies(studies: NumericalStudiesResult) -> None:
+    """Present repeated-run summaries without retaining any experiment paths."""
+    st.plotly_chart(path_count_study_figure(studies.path_count), use_container_width=True)
+    st.caption(
+        "Every point reruns path simulation, all LSMC continuation regressions and the "
+        "stopping policy. The band is the 2.5–97.5% empirical replication interval, "
+        "not a confidence interval containing all model and regression uncertainty."
+    )
+
+    if studies.exercise_grid is not None:
+        st.plotly_chart(
+            exercise_grid_study_figure(studies.exercise_grid),
+            use_container_width=True,
+        )
+        st.caption(
+            "Under GBM the transition between selected dates is exact. Refining this "
+            "grid therefore mainly increases the number of permitted exercise dates."
+        )
+
+    st.plotly_chart(
+        basis_sensitivity_study_figure(studies.basis_sensitivity),
+        use_container_width=True,
+    )
+    basis_rows = [
+        {
+            "Basis terms": ", ".join(point.basis_terms),
+            "Mean estimated value": point.mean_estimate,
+            "Empirical standard deviation": point.empirical_standard_deviation,
+            "Replications": len(point.runs),
+        }
+        for point in studies.basis_sensitivity.points
+    ]
+    st.dataframe(pd.DataFrame(basis_rows), hide_index=True, use_container_width=True)
+    st.caption(
+        "The basis study holds the paths, time grid and model inputs fixed by seed while "
+        "refitting the complete stopping policy for each specification."
+    )
+    st.download_button(
+        "Download numerical studies (CSV)",
+        data=studies_to_csv(studies),
+        file_name="numerical_studies.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    st.caption(
+        "Static Plotly image export requires the optional Kaleido dependency, which is "
+        "not included in this project."
+    )
 
 
 def _methodology() -> None:
