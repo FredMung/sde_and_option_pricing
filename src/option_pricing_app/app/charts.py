@@ -332,11 +332,14 @@ def _repeated_study_figure(
     points: tuple[ExperimentPoint, ...],
     title: str,
     xaxis_title: str,
-    *,
-    categorical: bool = False,
 ) -> go.Figure:
-    """Plot repeated full-pricing estimates and empirical replication quantiles."""
-    x_values = [point.setting_label if categorical else point.setting_value for point in points]
+    """Plot repeated full-pricing estimates and empirical replication quantiles.
+
+    Only appropriate for settings with a genuine continuous ordering (path count,
+    exercise-grid size); the connecting line and band imply interpolation between
+    x-values, which is not valid for categorical settings such as basis choice.
+    """
+    x_values = [point.setting_value for point in points]
     lower = np.asarray([point.lower_empirical_quantile for point in points])
     upper = np.asarray([point.upper_empirical_quantile for point in points])
     means = np.asarray([point.mean_estimate for point in points])
@@ -450,26 +453,94 @@ def exercise_grid_study_figure(study: ExerciseGridStudyResult) -> go.Figure:
 
 
 def basis_sensitivity_study_figure(study: BasisSensitivityStudyResult) -> go.Figure:
-    """Plot repeated American estimates across documented LSMC basis choices."""
-    return _repeated_study_figure(
-        study.points,
-        "LSMC basis-function sensitivity",
-        "Basis specification",
-        categorical=True,
+    """Plot repeated American estimates across documented LSMC basis choices.
+
+    Basis specifications are categorical and unordered, so unlike the path-count and
+    exercise-grid studies this draws independent points per basis rather than a
+    connected line or shaded band, which would falsely imply a continuous ordering.
+    """
+    labels = [point.setting_label for point in study.points]
+    means = np.asarray([point.mean_estimate for point in study.points])
+    lower = np.asarray([point.lower_empirical_quantile for point in study.points])
+    upper = np.asarray([point.upper_empirical_quantile for point in study.points])
+    figure = go.Figure()
+    run_x = []
+    run_y = []
+    run_seed = []
+    for label, point in zip(labels, study.points, strict=True):
+        for run in point.runs:
+            run_x.append(label)
+            run_y.append(run.estimated_price)
+            run_seed.append(run.seed)
+    figure.add_trace(
+        go.Scatter(
+            x=run_x,
+            y=run_y,
+            mode="markers",
+            marker={"size": 6, "color": PRIMARY_BLUE, "opacity": 0.28},
+            name="Individual replication",
+            customdata=run_seed,
+            hovertemplate=(
+                "Basis=%{x}<br>Estimate=%{y:.4f}<br>Seed=%{customdata}<extra></extra>"
+            ),
+        )
     )
+    figure.add_trace(
+        go.Scatter(
+            x=labels,
+            y=means,
+            mode="markers",
+            marker={
+                "size": 12,
+                "color": PRIMARY_BLUE,
+                "symbol": "diamond",
+                "line": {"width": 1, "color": "white"},
+            },
+            error_y={
+                "type": "data",
+                "symmetric": False,
+                "array": upper - means,
+                "arrayminus": means - lower,
+                "color": PRIMARY_BLUE,
+                "thickness": 2,
+                "width": 8,
+            },
+            name="Mean, 95% empirical replication interval",
+            hovertemplate=(
+                "Basis=%{x}<br>Mean=%{y:.4f}<br>2.5%=%{customdata[0]:.4f}<br>"
+                "97.5%=%{customdata[1]:.4f}<extra></extra>"
+            ),
+            customdata=np.stack([lower, upper], axis=1),
+        )
+    )
+    figure.update_layout(
+        title="LSMC basis-function sensitivity",
+        xaxis_title="Basis specification",
+        xaxis={"type": "category"},
+        yaxis_title="Estimated American put value",
+        template="plotly_white",
+        height=430,
+    )
+    return figure
 
 
 def exercise_figure(result: PricingResult) -> go.Figure:
-    """Plot the share of all paths whose selected stopping time is each step."""
+    """Plot the share of all paths whose selected stopping time is each time point."""
     if result.exercise_percentages is None:
         raise ValueError("Exercise frequencies are only available for American options")
     early_exercise_percentage = float(np.sum(result.exercise_percentages[:-1]))
+    bar_width = (
+        0.8 * float(np.min(np.diff(result.time_grid)))
+        if result.time_grid.size > 1
+        else None
+    )
     figure = go.Figure(
         go.Bar(
-            x=np.arange(result.exercise_percentages.size),
+            x=result.time_grid,
             y=result.exercise_percentages,
+            width=bar_width,
             marker_color=PRIMARY_BLUE,
-            hovertemplate="Step=%{x}<br>Paths exercised=%{y:.2f}%<extra></extra>",
+            hovertemplate="t=%{x:.3f} years<br>Paths exercised=%{y:.2f}%<extra></extra>",
         )
     )
     figure.add_annotation(
@@ -483,8 +554,8 @@ def exercise_figure(result: PricingResult) -> go.Figure:
         showarrow=False,
     )
     figure.update_layout(
-        title="LSMC stopping policy by exercise step",
-        xaxis_title="Exercise step (final step is maturity)",
+        title="LSMC stopping policy by exercise time",
+        xaxis_title="Exercise time (years, final point is maturity)",
         yaxis_title="Percentage of all paths",
         yaxis={"ticksuffix": "%"},
         template="plotly_white",

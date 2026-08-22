@@ -57,6 +57,17 @@ MANUAL_MATURITY = "Manual maturity"
 MIN_PLAUSIBLE_IMPLIED_VOLATILITY = 0.05
 MAX_PLAUSIBLE_IMPLIED_VOLATILITY = 3.00
 MAX_HOSTED_STUDY_PATH_STEPS = 100_000_000
+DEFAULT_STUDY_REPLICATIONS = 20
+# Chosen so a full numerical-studies run (path-count, exercise-grid where
+# applicable, and basis sensitivity) at DEFAULT_STUDY_REPLICATIONS stays comfortably
+# under MAX_HOSTED_STUDY_PATH_STEPS while still giving a visible convergence trend.
+# GBM's exercise-grid study is the main cost driver there, so its step count stays
+# moderate; Heston has no exercise-grid study but has time-discretisation error from
+# its Euler scheme, so its budget goes to more time steps instead.
+DEFAULT_SIMULATION_SETTINGS = {
+    "GBM": {"n_paths": 5_000, "n_steps": 100},
+    "Heston": {"n_paths": 5_000, "n_steps": 120},
+}
 
 
 @dataclass(frozen=True)
@@ -142,14 +153,20 @@ def run_dashboard() -> None:
                     inputs.heston_inputs,
                 )
             st.session_state["pricing_output"] = (result, inputs)
-            st.session_state.pop("numerical_studies_output", None)
+            st.session_state["numerical_studies_base_seed"] = (
+                inputs.simulation.seed
+                if inputs.simulation.seed is not None
+                else generate_base_seed()
+            )
         except (ValueError, FloatingPointError) as exc:
             st.error(f"The simulation could not be completed: {exc}")
 
     output = st.session_state.get("pricing_output")
     if output:
-        _results(*output)
-        _numerical_studies(output[1])
+        result, dashboard_inputs = output
+        _headline_results(result, dashboard_inputs)
+        _numerical_studies(dashboard_inputs)
+        _supplementary_results(result, dashboard_inputs)
     else:
         st.info("Choose assumptions in the sidebar, then generate a simulation.")
     _methodology()
@@ -263,10 +280,27 @@ def _controls() -> DashboardInputs | None:
 
     sidebar.divider()
     sidebar.subheader("Simulation")
+    simulation_defaults = DEFAULT_SIMULATION_SETTINGS[model]
     n_paths = int(
-        sidebar.number_input("Number of paths", 100, 25_000, 1_000, step=500)
+        sidebar.number_input(
+            "Number of paths",
+            100,
+            25_000,
+            simulation_defaults["n_paths"],
+            step=500,
+            key=f"n_paths_{model.lower()}",
+        )
     )
-    n_steps = int(sidebar.number_input("Number of time steps", 1, 1_000, 100, step=10))
+    n_steps = int(
+        sidebar.number_input(
+            "Number of time steps",
+            1,
+            1_000,
+            simulation_defaults["n_steps"],
+            step=10,
+            key=f"n_steps_{model.lower()}",
+        )
+    )
     if exercise_style is ExerciseStyle.AMERICAN:
         basis_options = HESTON_BASIS_TERMS if model == "Heston" else PRICE_BASIS_TERMS
         default_basis = (
@@ -519,7 +553,7 @@ def _maturity(expiry: str) -> float:
     return days / 365.25
 
 
-def _results(result: PricingResult, inputs: DashboardInputs) -> None:
+def _headline_results(result: PricingResult, inputs: DashboardInputs) -> None:
     st.subheader("Simulation results")
     st.caption("Results reflect the inputs captured when Generate simulation was pressed.")
     low, high = result.confidence_interval
@@ -567,6 +601,8 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
         st.metric("Monte Carlo standard error", f"{result.standard_error:,.4f}")
         st.metric("Approximate 95% interval", f"[{low:,.4f}, {high:,.4f}]")
 
+
+def _supplementary_results(result: PricingResult, inputs: DashboardInputs) -> None:
     if not (result.discounted_realised_cash_flows > 0).any():
         st.warning(
             "No simulated path produced a positive option cash flow. This can occur "
@@ -702,9 +738,14 @@ def _results(result: PricingResult, inputs: DashboardInputs) -> None:
 
 
 def _numerical_studies(inputs: DashboardInputs) -> None:
-    """Render separately triggered repeated-run convergence and sensitivity studies."""
+    """Automatically run and render the repeated-run convergence and sensitivity studies."""
     st.divider()
     st.subheader("Numerical studies")
+    st.caption(
+        "This is the key analysis: repeated, fully independent reruns of the "
+        "simulation and LSMC fit, used to assess convergence and sensitivity rather "
+        "than to report a single point estimate."
+    )
     if inputs.exercise_style is not ExerciseStyle.AMERICAN:
         st.info("Numerical LSMC studies are available when the exercise style is American.")
         return
@@ -714,7 +755,7 @@ def _numerical_studies(inputs: DashboardInputs) -> None:
             "Number of replications",
             min_value=3,
             max_value=20,
-            value=5,
+            value=DEFAULT_STUDY_REPLICATIONS,
             step=1,
             help="Each setting is fully simulated and refitted once per replication seed.",
         )
@@ -748,42 +789,34 @@ def _numerical_studies(inputs: DashboardInputs) -> None:
             "discretisation of the Heston SDEs."
         )
 
-    too_expensive = path_steps > MAX_HOSTED_STUDY_PATH_STEPS
-    if too_expensive:
+    if path_steps > MAX_HOSTED_STUDY_PATH_STEPS:
         st.warning(
-            "This requested study is too expensive for the hosted-app workload limit. "
-            "Reduce paths, time steps, basis complexity, or replications; the requested "
-            "settings have not been changed automatically."
+            "This study is too expensive for the hosted-app workload limit, so it has "
+            "not run automatically. Reduce paths, time steps, basis complexity, or "
+            "replications."
         )
-    if st.button(
-        "Run numerical studies",
-        type="primary",
-        disabled=too_expensive,
-        use_container_width=True,
-    ):
-        base_seed = (
-            inputs.simulation.seed
-            if inputs.simulation.seed is not None
-            else generate_base_seed()
-        )
-        try:
-            with st.spinner("Running repeated simulations and LSMC fits..."):
-                result = cached_numerical_studies(
-                    inputs.contract,
-                    inputs.market,
-                    inputs.simulation,
-                    inputs.model,
-                    inputs.heston_inputs,
-                    base_seed,
-                    replications,
-                )
-            st.session_state["numerical_studies_output"] = result
-        except (ValueError, FloatingPointError) as exc:
-            st.error(f"The numerical studies could not be completed: {exc}")
-
-    studies = st.session_state.get("numerical_studies_output")
-    if not studies:
         return
+
+    base_seed = st.session_state.get("numerical_studies_base_seed")
+    if base_seed is None:
+        base_seed = generate_base_seed()
+        st.session_state["numerical_studies_base_seed"] = base_seed
+    try:
+        with st.spinner("Running repeated simulations and LSMC fits..."):
+            studies = cached_numerical_studies(
+                inputs.contract,
+                inputs.market,
+                inputs.simulation,
+                inputs.model,
+                inputs.heston_inputs,
+                base_seed,
+                replications,
+            )
+    except (ValueError, FloatingPointError) as exc:
+        st.error(f"The numerical studies could not be completed: {exc}")
+        return
+
+    st.session_state["numerical_studies_output"] = studies
     _render_numerical_studies(studies)
 
 

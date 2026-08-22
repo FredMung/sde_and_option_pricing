@@ -88,19 +88,21 @@ def test_app_starts_and_generates_manual_result():
         widget.label == "Exercise timestep for continuation diagnostic"
         for widget in app.selectbox
     )
-    assert any(button.label == "Run numerical studies" for button in app.button)
+    # Numerical studies now run automatically alongside the main simulation, with no
+    # separate trigger button.
+    assert not any(button.label == "Run numerical studies" for button in app.button)
     assert any(
         widget.label == "Number of replications" for widget in app.number_input
     )
+    assert "numerical_studies_output" in app.session_state
+    assert len(app.session_state["numerical_studies_output"].path_count.derived_seeds) == 20
     next(
         widget
         for widget in app.number_input
         if widget.label == "Number of replications"
     ).set_value(3)
-    next(button for button in app.button if button.label == "Run numerical studies").click()
     app.run(timeout=60)
     assert not app.exception
-    assert "numerical_studies_output" in app.session_state
     studies = app.session_state["numerical_studies_output"]
     assert len(studies.path_count.derived_seeds) == 3
     assert studies.exercise_grid is not None
