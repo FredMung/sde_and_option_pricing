@@ -19,6 +19,7 @@ from option_pricing_app.app.charts import (
     terminal_figure,
     variance_paths_figure,
 )
+from option_pricing_app.app.static_export import numerical_studies_pdf
 from option_pricing_app.domain import (
     HESTON_BASIS_TERMS,
     PRICE_BASIS_TERMS,
@@ -857,16 +858,25 @@ def _render_numerical_studies(studies: NumericalStudiesResult) -> None:
         "The basis study holds the paths, time grid and model inputs fixed by seed while "
         "refitting the complete stopping policy for each specification."
     )
-    st.download_button(
+    download_csv, download_pdf = st.columns(2)
+    download_csv.download_button(
         "Download numerical studies (CSV)",
         data=studies_to_csv(studies),
         file_name="numerical_studies.csv",
         mime="text/csv",
         use_container_width=True,
     )
+    download_pdf.download_button(
+        "Download numerical studies charts (PDF)",
+        data=numerical_studies_pdf(studies),
+        file_name="numerical_studies.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
     st.caption(
-        "Static Plotly image export requires the optional Kaleido dependency, which is "
-        "not included in this project."
+        "The PDF is a vector figure regenerated directly from the summary statistics "
+        "above (the same data as the CSV export), not a rendering of the interactive "
+        "Plotly figures, which would require the optional Kaleido dependency."
     )
 
 
