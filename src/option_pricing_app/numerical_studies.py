@@ -23,7 +23,7 @@ from option_pricing_app.domain import (
     PutContract,
     SimulationConfig,
 )
-from option_pricing_app.service import black_scholes_put_price, price_put
+from option_pricing_app.service import crr_american_put_price, price_put
 
 PATH_COUNT_CANDIDATES = (100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000)
 EXERCISE_GRID_CANDIDATES = (5, 10, 25, 50, 100, 250, 500, 1_000)
@@ -46,6 +46,8 @@ class ExperimentPoint:
     empirical_standard_deviation: float
     lower_empirical_quantile: float
     upper_empirical_quantile: float
+    bias_vs_binomial: float | None
+    rmse_vs_binomial: float | None
 
 
 @dataclass(frozen=True)
@@ -59,7 +61,7 @@ class PathCountStudyResult:
     time_steps: int
     basis_terms: tuple[str, ...]
     heston_inputs: HestonInputs | None
-    european_reference: float | None
+    binomial_reference: float | None
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,7 @@ class ExerciseGridStudyResult:
     path_count: int
     basis_terms: tuple[str, ...]
     heston_inputs: HestonInputs | None
+    binomial_reference: float | None
 
 
 @dataclass(frozen=True)
@@ -86,6 +89,7 @@ class BasisSensitivityStudyResult:
     path_count: int
     time_steps: int
     heston_inputs: HestonInputs | None
+    binomial_reference: float | None
 
 
 @dataclass(frozen=True)
@@ -160,8 +164,15 @@ def _aggregate_point(
     setting_label: str,
     basis_terms: tuple[str, ...],
     runs: list[ExperimentRun],
+    binomial_reference: float | None,
 ) -> ExperimentPoint:
     estimates = np.asarray([run.estimated_price for run in runs], dtype=float)
+    bias_vs_binomial = None
+    rmse_vs_binomial = None
+    if binomial_reference is not None:
+        errors = estimates - binomial_reference
+        bias_vs_binomial = float(np.mean(errors))
+        rmse_vs_binomial = float(np.sqrt(np.mean(errors**2)))
     return ExperimentPoint(
         setting_value=setting_value,
         setting_label=setting_label,
@@ -171,6 +182,8 @@ def _aggregate_point(
         empirical_standard_deviation=float(np.std(estimates, ddof=1)),
         lower_empirical_quantile=float(np.quantile(estimates, 0.025)),
         upper_empirical_quantile=float(np.quantile(estimates, 0.975)),
+        bias_vs_binomial=bias_vs_binomial,
+        rmse_vs_binomial=rmse_vs_binomial,
     )
 
 
@@ -187,6 +200,7 @@ def _run_point(
     basis_terms: tuple[str, ...],
     seeds: tuple[int, ...],
     pricing_function: PricingFunction,
+    binomial_reference: float | None,
 ) -> ExperimentPoint:
     runs = []
     for seed in seeds:
@@ -201,7 +215,7 @@ def _run_point(
             heston_inputs,
         )
         runs.append(ExperimentRun(seed, result.price, result.standard_error))
-    return _aggregate_point(setting_value, setting_label, basis_terms, runs)
+    return _aggregate_point(setting_value, setting_label, basis_terms, runs, binomial_reference)
 
 
 def run_path_count_study(
@@ -215,6 +229,7 @@ def run_path_count_study(
     pricing_function: PricingFunction = price_put,
 ) -> PathCountStudyResult:
     seeds = derive_replication_seeds(base_seed, replications)
+    binomial_reference = crr_american_put_price(contract, market) if model == "GBM" else None
     points = tuple(
         _run_point(
             setting_value=path_count,
@@ -228,10 +243,10 @@ def run_path_count_study(
             basis_terms=config.basis_terms,
             seeds=seeds,
             pricing_function=pricing_function,
+            binomial_reference=binomial_reference,
         )
         for path_count in make_path_count_grid(config.n_paths)
     )
-    european_reference = black_scholes_put_price(contract, market) if model == "GBM" else None
     return PathCountStudyResult(
         base_seed,
         seeds,
@@ -242,7 +257,7 @@ def run_path_count_study(
         config.n_steps,
         config.basis_terms,
         heston_inputs,
-        european_reference,
+        binomial_reference,
     )
 
 
@@ -259,6 +274,7 @@ def run_exercise_grid_study(
     if model != "GBM":
         raise ValueError("The exercise-grid study is currently limited to GBM")
     seeds = derive_replication_seeds(base_seed, replications)
+    binomial_reference = crr_american_put_price(contract, market)
     points = tuple(
         _run_point(
             setting_value=time_steps,
@@ -272,6 +288,7 @@ def run_exercise_grid_study(
             basis_terms=config.basis_terms,
             seeds=seeds,
             pricing_function=pricing_function,
+            binomial_reference=binomial_reference,
         )
         for time_steps in make_exercise_grid(config.n_steps)
     )
@@ -285,6 +302,7 @@ def run_exercise_grid_study(
         config.n_paths,
         config.basis_terms,
         heston_inputs,
+        binomial_reference,
     )
 
 
@@ -300,6 +318,7 @@ def run_basis_sensitivity_study(
 ) -> BasisSensitivityStudyResult:
     seeds = derive_replication_seeds(base_seed, replications)
     specifications = basis_specifications(model, config.basis_terms)
+    binomial_reference = crr_american_put_price(contract, market) if model == "GBM" else None
     points = tuple(
         _run_point(
             setting_value=" + ".join(terms),
@@ -313,6 +332,7 @@ def run_basis_sensitivity_study(
             basis_terms=terms,
             seeds=seeds,
             pricing_function=pricing_function,
+            binomial_reference=binomial_reference,
         )
         for terms in specifications
     )
@@ -326,6 +346,7 @@ def run_basis_sensitivity_study(
         config.n_paths,
         config.n_steps,
         heston_inputs,
+        binomial_reference,
     )
 
 
@@ -394,6 +415,8 @@ def studies_to_csv(studies: NumericalStudiesResult) -> str:
         "heston_volatility_of_variance",
         "heston_correlation",
         "heston_initial_variance",
+        "binomial_reference_price",
+        "error_vs_binomial_reference",
     ]
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
@@ -457,6 +480,16 @@ def studies_to_csv(studies: NumericalStudiesResult) -> str:
                         "heston_initial_variance": (
                             study.heston_inputs.initial_variance
                             if study.heston_inputs is not None
+                            else ""
+                        ),
+                        "binomial_reference_price": (
+                            study.binomial_reference
+                            if study.binomial_reference is not None
+                            else ""
+                        ),
+                        "error_vs_binomial_reference": (
+                            run.estimated_price - study.binomial_reference
+                            if study.binomial_reference is not None
                             else ""
                         ),
                     }

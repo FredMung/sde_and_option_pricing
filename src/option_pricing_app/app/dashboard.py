@@ -47,7 +47,7 @@ from option_pricing_app.numerical_studies import (
     run_numerical_studies,
     studies_to_csv,
 )
-from option_pricing_app.service import price_put
+from option_pricing_app.service import CRR_BINOMIAL_STEPS, price_put
 
 DISCLAIMER = (
     "This application is an educational proof of concept. Its purpose is to demonstrate the concepts behind "
@@ -585,6 +585,23 @@ def _headline_results(result: PricingResult, inputs: DashboardInputs) -> None:
                 "Estimated European put value",
                 f"{result.european_mc_price:,.4f}",
             )
+            early_exercise_premium = result.price - result.european_mc_price
+            premium_standard_error = (
+                result.standard_error**2 + result.european_mc_standard_error**2
+            ) ** 0.5
+            st.metric(
+                "Early-exercise premium (American − European)",
+                f"{early_exercise_premium:,.4f}",
+                delta=f"± {premium_standard_error:,.4f} approx. SE",
+                delta_color="off",
+                help=(
+                    "American minus European Monte Carlo estimate under the same "
+                    "simulated paths: the value the LSMC early-exercise feature adds. "
+                    "The shown standard error treats the two estimates as "
+                    "independent, which is a conservative (wider) approximation "
+                    "since both use the same paths."
+                ),
+            )
         else:
             st.metric("Estimated European put value", f"{result.price:,.4f}")
             if result.european_exact_price is not None:
@@ -668,10 +685,12 @@ def _supplementary_results(result: PricingResult, inputs: DashboardInputs) -> No
         )
         boundary_caption = (
             "Each point is obtained by solving immediate payoff = fitted continuation "
-            "value on that timestep's observed in-the-money price range. Missing "
-            "timesteps had too few observations or no economically ordered crossing; "
-            "no boundary is extrapolated. The line is unsmoothed and can therefore be "
-            "noisy, particularly near maturity."
+            "value on that timestep's observed in-the-money price range. A point is "
+            "shown only when there are sufficient in-the-money observations and exactly "
+            "one exercise-to-continuation sign change. Missing timesteps had too few "
+            "observations, no in-range crossing, or several crossings. No boundary is "
+            "extrapolated or selected arbitrarily from multiple roots. Gaps are retained "
+            "between omitted timesteps."
         )
         if any(
             diagnostic.representative_variance is not None
@@ -821,6 +840,19 @@ def _numerical_studies(inputs: DashboardInputs) -> None:
     _render_numerical_studies(studies)
 
 
+def _bias_rmse_rows(points, setting_column: str) -> list[dict]:
+    return [
+        {
+            setting_column: point.setting_label,
+            "Mean estimated value": point.mean_estimate,
+            "Bias vs CRR binomial": point.bias_vs_binomial,
+            "RMSE vs CRR binomial": point.rmse_vs_binomial,
+            "Replications": len(point.runs),
+        }
+        for point in points
+    ]
+
+
 def _render_numerical_studies(studies: NumericalStudiesResult) -> None:
     """Present repeated-run summaries without retaining any experiment paths."""
     st.plotly_chart(path_count_study_figure(studies.path_count), use_container_width=True)
@@ -829,6 +861,18 @@ def _render_numerical_studies(studies: NumericalStudiesResult) -> None:
         "stopping policy. The band is the 2.5–97.5% empirical replication interval, "
         "not a confidence interval containing all model and regression uncertainty."
     )
+    if studies.path_count.binomial_reference is not None:
+        st.dataframe(
+            pd.DataFrame(_bias_rmse_rows(studies.path_count.points, "Path count")),
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.caption(
+            f"CRR binomial-tree reference (American, {CRR_BINOMIAL_STEPS:,} steps): "
+            f"{studies.path_count.binomial_reference:,.4f}. Bias is the mean LSMC "
+            "estimate minus this independently computed reference; RMSE combines bias "
+            "and replication variance and is never smaller than |bias|."
+        )
 
     if studies.exercise_grid is not None:
         st.plotly_chart(
@@ -839,6 +883,19 @@ def _render_numerical_studies(studies: NumericalStudiesResult) -> None:
             "Under GBM the transition between selected dates is exact. Refining this "
             "grid therefore mainly increases the number of permitted exercise dates."
         )
+        if studies.exercise_grid.binomial_reference is not None:
+            st.dataframe(
+                pd.DataFrame(
+                    _bias_rmse_rows(studies.exercise_grid.points, "Exercise dates")
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
+            st.caption(
+                "Bias and RMSE against the same CRR binomial reference as the "
+                "path-count study, isolating how the exercise-date grid alone affects "
+                "accuracy."
+            )
 
     st.plotly_chart(
         basis_sensitivity_study_figure(studies.basis_sensitivity),
@@ -849,6 +906,8 @@ def _render_numerical_studies(studies: NumericalStudiesResult) -> None:
             "Basis terms": ", ".join(point.basis_terms),
             "Mean estimated value": point.mean_estimate,
             "Empirical standard deviation": point.empirical_standard_deviation,
+            "Bias vs CRR binomial": point.bias_vs_binomial,
+            "RMSE vs CRR binomial": point.rmse_vs_binomial,
             "Replications": len(point.runs),
         }
         for point in studies.basis_sensitivity.points
@@ -856,7 +915,8 @@ def _render_numerical_studies(studies: NumericalStudiesResult) -> None:
     st.dataframe(pd.DataFrame(basis_rows), hide_index=True, use_container_width=True)
     st.caption(
         "The basis study holds the paths, time grid and model inputs fixed by seed while "
-        "refitting the complete stopping policy for each specification."
+        "refitting the complete stopping policy for each specification. Bias and RMSE "
+        "are only populated under GBM, where the CRR binomial tree is a valid reference."
     )
     download_csv, download_pdf = st.columns(2)
     download_csv.download_button(

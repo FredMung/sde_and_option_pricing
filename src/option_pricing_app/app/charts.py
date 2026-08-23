@@ -22,6 +22,7 @@ BLUE_BAND = "rgba(91, 155, 213, 0.18)"
 REFERENCE_RED = "#FF3B30"
 CONTINUATION_ORANGE = "#ff7f0e"
 STRIKE_PURPLE = "#7a3e9d"
+BINOMIAL_GREEN = "#2CA02C"
 EXERCISE_FILL = "rgba(255, 59, 48, 0.08)"
 CONTINUATION_FILL = "rgba(91, 155, 213, 0.10)"
 
@@ -432,24 +433,35 @@ def path_count_study_figure(study: PathCountStudyResult) -> go.Figure:
             hovertemplate="Selected paths=%{x:,}<br>Mean=%{y:.4f}<extra></extra>",
         )
     )
-    if study.european_reference is not None:
+    if study.binomial_reference is not None:
         figure.add_hline(
-            y=study.european_reference,
-            line_dash="dash",
-            line_color=CONTINUATION_ORANGE,
+            y=study.binomial_reference,
+            line_dash="dot",
+            line_color=BINOMIAL_GREEN,
             line_width=3,
-            annotation_text="European Black–Scholes value",
+            annotation_text="CRR binomial reference (American)",
+            annotation_position="bottom right",
         )
     return figure
 
 
 def exercise_grid_study_figure(study: ExerciseGridStudyResult) -> go.Figure:
     """Plot repeated American estimates as the permitted exercise grid is refined."""
-    return _repeated_study_figure(
+    figure = _repeated_study_figure(
         study.points,
         "Exercise-grid convergence study",
         "Number of exercise dates",
     )
+    if study.binomial_reference is not None:
+        figure.add_hline(
+            y=study.binomial_reference,
+            line_dash="dot",
+            line_color=BINOMIAL_GREEN,
+            line_width=3,
+            annotation_text="CRR binomial reference (American)",
+            annotation_position="bottom right",
+        )
+    return figure
 
 
 def basis_sensitivity_study_figure(study: BasisSensitivityStudyResult) -> go.Figure:
@@ -513,6 +525,15 @@ def basis_sensitivity_study_figure(study: BasisSensitivityStudyResult) -> go.Fig
             customdata=np.stack([lower, upper], axis=1),
         )
     )
+    if study.binomial_reference is not None:
+        figure.add_hline(
+            y=study.binomial_reference,
+            line_dash="dot",
+            line_color=BINOMIAL_GREEN,
+            line_width=3,
+            annotation_text="CRR binomial reference (American)",
+            annotation_position="bottom right",
+        )
     figure.update_layout(
         title="LSMC basis-function sensitivity",
         xaxis_title="Basis specification",
@@ -635,9 +656,9 @@ def exercise_vs_continuation_figure(
         )
     else:
         reason = (
-            "Insufficient ITM paths for a reliable boundary"
+            "Insufficient ITM paths for a supported boundary"
             if diagnostic.itm_path_count < diagnostic.minimum_required_paths
-            else "No reliable exercise-to-continuation crossing within the ITM support"
+            else "No single exercise-to-continuation crossing within the ITM support"
         )
         figure.add_annotation(
             x=0.5,
@@ -659,21 +680,29 @@ def exercise_vs_continuation_figure(
 
 
 def exercise_boundary_figure(result: PricingResult, contract: PutContract) -> go.Figure:
-    """Plot reliable regression-based American put boundaries through time."""
+    """Plot accepted regression-based American put boundaries through time."""
     if result.continuation_diagnostics is None:
         raise ValueError("Exercise boundaries are only available for American options")
 
-    reliable = [
+    accepted = [
         diagnostic
         for diagnostic in result.continuation_diagnostics
         if np.isfinite(diagnostic.boundary)
     ]
     figure = go.Figure()
-    if reliable:
-        times = np.array([diagnostic.time for diagnostic in reliable])
-        boundaries = np.array([diagnostic.boundary for diagnostic in reliable])
-        floor = max(0.0, float(np.min(boundaries)) * 0.95)
-        ceiling = max(contract.strike, float(np.max(boundaries))) * 1.02
+    if accepted:
+        times = np.asarray(result.time_grid[1:-1], dtype=float)
+        boundaries = np.full(times.shape, np.nan, dtype=float)
+        itm_counts = np.full(times.shape, np.nan, dtype=float)
+        for diagnostic in result.continuation_diagnostics:
+            grid_index = diagnostic.timestep - 1
+            if 0 <= grid_index < boundaries.size:
+                itm_counts[grid_index] = diagnostic.itm_path_count
+                if np.isfinite(diagnostic.boundary):
+                    boundaries[grid_index] = diagnostic.boundary
+        finite_boundaries = boundaries[np.isfinite(boundaries)]
+        floor = max(0.0, float(np.min(finite_boundaries)) * 0.95)
+        ceiling = max(contract.strike, float(np.max(finite_boundaries))) * 1.02
         figure.add_trace(
             go.Scatter(
                 x=times,
@@ -713,11 +742,11 @@ def exercise_boundary_figure(result: PricingResult, contract: PutContract) -> go
                 x=times,
                 y=boundaries,
                 mode="lines+markers",
-                connectgaps=True,
+                connectgaps=False,
                 line={"width": 3, "color": PRIMARY_BLUE},
                 marker={"size": 5, "color": PRIMARY_BLUE},
                 name="Estimated exercise boundary",
-                customdata=np.array([diagnostic.itm_path_count for diagnostic in reliable]),
+                customdata=itm_counts,
                 hovertemplate=(
                     "t=%{x:.3f} years<br>Boundary=%{y:.2f}"
                     "<br>ITM paths=%{customdata:,}<extra></extra>"
@@ -731,14 +760,15 @@ def exercise_boundary_figure(result: PricingResult, contract: PutContract) -> go
             y=0.5,
             xref="paper",
             yref="paper",
-            text="No reliable regression crossing was found on the observed ITM support.",
+            text="No single supported regression crossing was found on the observed ITM support.",
             showarrow=False,
         )
 
     figure.add_hline(
         y=contract.strike,
-        line_color=STRIKE_PURPLE,
-        line_width=2,
+        line_dash="dash",
+        line_color=REFERENCE_RED,
+        line_width=3,
         annotation_text=f"K = {contract.strike:,.2f}",
     )
     variance_note = ""

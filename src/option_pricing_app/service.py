@@ -183,12 +183,12 @@ def estimate_exercise_boundary(
     itm_path_count: int,
     minimum_required_paths: int,
 ) -> float:
-    """Return the economically meaningful exercise-to-continuation crossing.
+    """Return one supported exercise-to-continuation crossing.
 
-    A put boundary must separate a predominantly low-price exercise region from a
-    predominantly higher-price continuation region. If several polynomial crossings
-    exist, the candidate with the strongest agreement with that ordering is selected.
-    No value is returned outside the observed in-the-money price support.
+    A put boundary must move from exercise at lower prices to continuation at higher
+    prices. The crossing is accepted only when exactly one such sign change occurs
+    within the observed in-the-money price support. Multiple crossings are treated as
+    an unclear regression result rather than resolved by an arbitrary selection rule.
     """
     prices = np.asarray(price_grid, dtype=float)
     payoff = np.asarray(immediate_payoff, dtype=float)
@@ -217,24 +217,25 @@ def estimate_exercise_boundary(
     if np.all(np.abs(difference) <= tolerance):
         return float("nan")
 
-    candidates = []
-    for index in range(prices.size - 1):
-        if difference[index] > tolerance and difference[index + 1] <= tolerance:
-            low_price_exercise = float(np.mean(difference[: index + 1] > tolerance))
-            high_price_continue = float(np.mean(difference[index + 1 :] <= tolerance))
-            if low_price_exercise >= 0.60 and high_price_continue >= 0.60:
-                score = (
-                    min(low_price_exercise, high_price_continue),
-                    low_price_exercise + high_price_continue,
-                    -index,
-                )
-                candidates.append((score, index))
-
-    if not candidates:
+    signs = np.where(
+        difference > tolerance,
+        1,
+        np.where(difference < -tolerance, -1, 0),
+    )
+    nonzero_indices = np.flatnonzero(signs)
+    if nonzero_indices.size < 2:
         return float("nan")
-    _, index = max(candidates)
-    x0, x1 = prices[index], prices[index + 1]
-    d0, d1 = difference[index], difference[index + 1]
+    nonzero_signs = signs[nonzero_indices]
+    transitions = np.flatnonzero(nonzero_signs[:-1] != nonzero_signs[1:])
+    if transitions.size != 1:
+        return float("nan")
+    transition = int(transitions[0])
+    left_index = int(nonzero_indices[transition])
+    right_index = int(nonzero_indices[transition + 1])
+    if signs[left_index] != 1 or signs[right_index] != -1:
+        return float("nan")
+    x0, x1 = prices[left_index], prices[right_index]
+    d0, d1 = difference[left_index], difference[right_index]
     if np.isclose(d0, d1):
         return float((x0 + x1) / 2.0)
     return float(x0 - d0 * (x1 - x0) / (d1 - d0))
@@ -320,6 +321,47 @@ def black_scholes_put_price(contract: PutContract, market: MarketInputs) -> floa
 
 def _normal_cdf(value: float) -> float:
     return 0.5 * (1.0 + erf(value / sqrt(2.0)))
+
+
+CRR_BINOMIAL_STEPS = 4_000
+
+
+def crr_american_put_price(
+    contract: PutContract, market: MarketInputs, steps: int = CRR_BINOMIAL_STEPS
+) -> float:
+    """Return the American put price from a Cox–Ross–Rubinstein binomial tree.
+
+    This is an independent numerical method to the simulated LSMC estimator, used as
+    a converged reference value to validate LSMC American pricing under GBM. The
+    binomial tree only models constant-volatility lognormal dynamics, so it is not a
+    valid reference under Heston.
+    """
+    if steps < 1:
+        raise ValueError("steps must be positive")
+    dt = contract.maturity / steps
+    up = exp(market.volatility * sqrt(dt))
+    down = 1.0 / up
+    growth = exp(market.risk_free_rate * dt)
+    up_probability = (growth - down) / (up - down)
+    if not 0.0 < up_probability < 1.0:
+        raise ValueError(
+            "CRR binomial parameters imply a non-arbitrage-free up-probability; "
+            "reduce the time step or check the volatility and risk-free rate inputs."
+        )
+    discount = exp(-market.risk_free_rate * dt)
+
+    down_steps = np.arange(steps + 1)
+    terminal_prices = market.spot * up ** (steps - down_steps) * down**down_steps
+    values = np.maximum(contract.strike - terminal_prices, 0.0)
+    for step in range(steps - 1, -1, -1):
+        down_steps = np.arange(step + 1)
+        node_prices = market.spot * up ** (step - down_steps) * down**down_steps
+        continuation = discount * (
+            up_probability * values[:-1] + (1.0 - up_probability) * values[1:]
+        )
+        immediate_exercise = np.maximum(contract.strike - node_prices, 0.0)
+        values = np.maximum(continuation, immediate_exercise)
+    return float(values[0])
 
 
 def _convergence_trace(

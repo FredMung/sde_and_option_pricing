@@ -11,7 +11,6 @@ from option_pricing_app import (
 from option_pricing_app.app.charts import (
     PRIMARY_BLUE,
     REFERENCE_RED,
-    STRIKE_PURPLE,
     exercise_boundary_figure,
     exercise_vs_continuation_figure,
     path_count_study_figure,
@@ -60,14 +59,22 @@ def test_exercise_boundary_uses_regression_crossings_and_strike_reference(americ
     )
     expected = np.array(
         [
-            diagnostic.boundary
-            for diagnostic in result.continuation_diagnostics
-            if np.isfinite(diagnostic.boundary)
+            next(
+                (
+                    diagnostic.boundary
+                    for diagnostic in result.continuation_diagnostics
+                    if diagnostic.timestep == timestep
+                    and np.isfinite(diagnostic.boundary)
+                ),
+                np.nan,
+            )
+            for timestep in range(1, result.time_grid.size - 1)
         ]
     )
-    np.testing.assert_allclose(boundary_trace.y, expected)
+    np.testing.assert_allclose(boundary_trace.y, expected, equal_nan=True)
     assert boundary_trace.line.color == PRIMARY_BLUE
-    assert any(shape.line.color == STRIKE_PURPLE for shape in figure.layout.shapes)
+    assert boundary_trace.connectgaps is False
+    assert any(shape.line.color == REFERENCE_RED for shape in figure.layout.shapes)
 
 
 def test_exercise_boundary_rejects_european_result():

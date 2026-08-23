@@ -11,6 +11,7 @@ from option_pricing_app import (
 )
 from option_pricing_app.service import (
     black_scholes_put_price,
+    crr_american_put_price,
     estimate_exercise_boundary,
 )
 from option_pricing_app.stats import (
@@ -134,13 +135,30 @@ def test_stored_continuation_model_reproduces_fitted_values():
     assert model.basis_terms == ("1", "S", "S²")
 
 
-def test_boundary_uses_low_price_exercise_to_high_price_continuation_crossing():
+def test_boundary_uses_single_low_price_exercise_to_high_price_continuation_crossing():
+    prices = np.linspace(0.0, 10.0, 1_001)
+    payoff = 10.0 - prices
+    continuation = payoff - (5.0 - prices)
+    boundary = estimate_exercise_boundary(prices, payoff, continuation, 1_000, 10)
+    assert boundary == pytest.approx(5.0, abs=0.02)
+
+
+def test_boundary_is_missing_when_regression_has_multiple_ordered_crossings():
     prices = np.linspace(0.0, 10.0, 1_001)
     payoff = 10.0 - prices
     difference = -(prices - 2.0) * (prices - 4.0) * (prices - 6.0)
     continuation = payoff - difference
     boundary = estimate_exercise_boundary(prices, payoff, continuation, 1_000, 10)
-    assert boundary == pytest.approx(2.0, abs=0.02)
+    assert np.isnan(boundary)
+
+
+def test_boundary_is_missing_when_any_additional_crossing_is_present():
+    prices = np.linspace(0.0, 10.0, 1_001)
+    payoff = 10.0 - prices
+    difference = (prices - 2.0) * (5.0 - prices)
+    continuation = payoff - difference
+    boundary = estimate_exercise_boundary(prices, payoff, continuation, 1_000, 10)
+    assert np.isnan(boundary)
 
 
 def test_boundary_is_missing_when_crossing_is_unsupported_or_sample_is_small():
@@ -211,6 +229,36 @@ def test_black_scholes_put_matches_known_value():
         PutContract(100, 1), MarketInputs(100, 0.2, 0.05)
     )
     assert price == pytest.approx(5.573526, abs=1e-6)
+
+
+def test_crr_american_put_exceeds_european_black_scholes_value():
+    contract = PutContract(100, 1)
+    market = MarketInputs(100, 0.2, 0.05)
+    european = black_scholes_put_price(contract, market)
+    american = crr_american_put_price(contract, market)
+    assert american > european
+
+
+def test_crr_american_put_converges_as_steps_increase():
+    contract = PutContract(100, 1)
+    market = MarketInputs(100, 0.2, 0.05)
+    coarse = crr_american_put_price(contract, market, steps=500)
+    fine = crr_american_put_price(contract, market, steps=4_000)
+    finer = crr_american_put_price(contract, market, steps=8_000)
+    assert fine == pytest.approx(coarse, abs=0.02)
+    assert finer == pytest.approx(fine, abs=0.005)
+
+
+def test_crr_american_put_deep_itm_approaches_intrinsic_value():
+    contract = PutContract(100, 0.05)
+    market = MarketInputs(20, 0.2, 0.05)
+    price = crr_american_put_price(contract, market)
+    assert price == pytest.approx(contract.strike - market.spot, abs=0.05)
+
+
+def test_crr_american_put_rejects_non_positive_steps():
+    with pytest.raises(ValueError, match="steps must be positive"):
+        crr_american_put_price(PutContract(100, 1), MarketInputs(100, 0.2, 0.05), steps=0)
 
 
 @pytest.mark.parametrize(

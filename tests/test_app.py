@@ -73,6 +73,7 @@ def test_app_starts_and_generates_manual_result():
         "Manually input risk-free rate",
         "Estimated American put value",
         "Estimated European put value",
+        "Early-exercise premium (American − European)",
         "Monte Carlo standard error",
         "Approximate 95% interval",
     ]
@@ -84,6 +85,12 @@ def test_app_starts_and_generates_manual_result():
         ).delta
         == ""
     )
+    premium_metric = next(
+        metric
+        for metric in app.metric
+        if metric.label == "Early-exercise premium (American − European)"
+    )
+    assert premium_metric.delta.endswith("approx. SE")
     assert not any(
         widget.label == "Exercise timestep for continuation diagnostic"
         for widget in app.selectbox
