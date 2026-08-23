@@ -550,6 +550,7 @@ def exercise_figure(result: PricingResult) -> go.Figure:
     if result.exercise_percentages is None:
         raise ValueError("Exercise frequencies are only available for American options")
     early_exercise_percentage = float(np.sum(result.exercise_percentages[:-1]))
+    out_of_the_money_percentage = 100.0 * float(np.mean(result.terminal_payoffs == 0.0))
     bar_width = (
         0.8 * float(np.min(np.diff(result.time_grid)))
         if result.time_grid.size > 1
@@ -571,7 +572,10 @@ def exercise_figure(result: PricingResult) -> go.Figure:
         yref="paper",
         xanchor="right",
         yanchor="top",
-        text=f"Exercised before maturity: {early_exercise_percentage:.1f}% of paths",
+        text=(
+            f"Exercised before maturity: {early_exercise_percentage:.1f}% of paths"
+            f"<br>Out-of-the-money at maturity: {out_of_the_money_percentage:.1f}% of paths"
+        ),
         showarrow=False,
     )
     figure.update_layout(

@@ -40,6 +40,7 @@ from option_pricing_app.market_data import (
 )
 from option_pricing_app.numerical_studies import (
     NumericalStudiesResult,
+    crr_convergence_table,
     estimate_workload,
     generate_base_seed,
     make_exercise_grid,
@@ -685,12 +686,15 @@ def _supplementary_results(result: PricingResult, inputs: DashboardInputs) -> No
         )
         boundary_caption = (
             "Each point is obtained by solving immediate payoff = fitted continuation "
-            "value on that timestep's observed in-the-money price range. A point is "
+            "value on the central 5th-95th percentile of that timestep's in-the-money "
+            "prices; the thinly populated outer tails are excluded because the "
+            "regression is extrapolating rather than interpolating there. A point is "
             "shown only when there are sufficient in-the-money observations and exactly "
-            "one exercise-to-continuation sign change. Missing timesteps had too few "
-            "observations, no in-range crossing, or several crossings. No boundary is "
-            "extrapolated or selected arbitrarily from multiple roots. Gaps are retained "
-            "between omitted timesteps."
+            "one exercise-to-continuation sign change within that range. Missing "
+            "timesteps had too few observations, no in-range crossing, or several "
+            "crossings. No boundary is extrapolated beyond the trimmed range or "
+            "selected arbitrarily from multiple roots. Gaps are retained between "
+            "omitted timesteps."
         )
         if any(
             diagnostic.representative_variance is not None
@@ -845,6 +849,7 @@ def _bias_rmse_rows(points, setting_column: str) -> list[dict]:
         {
             setting_column: point.setting_label,
             "Mean estimated value": point.mean_estimate,
+            "Empirical standard deviation": point.empirical_standard_deviation,
             "Bias vs CRR binomial": point.bias_vs_binomial,
             "RMSE vs CRR binomial": point.rmse_vs_binomial,
             "Replications": len(point.runs),
@@ -853,8 +858,35 @@ def _bias_rmse_rows(points, setting_column: str) -> list[dict]:
     ]
 
 
+def _crr_convergence_rows(points) -> list[dict]:
+    return [
+        {
+            "Binomial steps": point.steps,
+            "CRR price": point.price,
+            "Change from previous": point.change_from_previous,
+        }
+        for point in points
+    ]
+
+
 def _render_numerical_studies(studies: NumericalStudiesResult) -> None:
     """Present repeated-run summaries without retaining any experiment paths."""
+    if studies.path_count.binomial_reference is not None:
+        st.markdown("#### CRR binomial-tree convergence")
+        crr_points = crr_convergence_table(studies.path_count.contract, studies.path_count.market)
+        st.dataframe(
+            pd.DataFrame(_crr_convergence_rows(crr_points)),
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.caption(
+            f"The CRR reference used throughout this section is computed at "
+            f"{CRR_BINOMIAL_STEPS:,} steps. This is a property of the binomial tree "
+            "itself, independent of the LSMC simulation: it shows the price has "
+            "already stabilised well before that step count, supporting its use as a "
+            "converged reference value."
+        )
+
     st.plotly_chart(path_count_study_figure(studies.path_count), use_container_width=True)
     st.caption(
         "Every point reruns path simulation, all LSMC continuation regressions and the "

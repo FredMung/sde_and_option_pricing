@@ -376,6 +376,37 @@ def run_numerical_studies(
     return NumericalStudiesResult(path_count, exercise_grid, basis)
 
 
+CRR_CONVERGENCE_STEPS = (100, 250, 500, 1_000, 2_000, 4_000, 8_000)
+
+
+@dataclass(frozen=True)
+class CRRConvergencePoint:
+    steps: int
+    price: float
+    change_from_previous: float | None
+
+
+def crr_convergence_table(
+    contract: PutContract,
+    market: MarketInputs,
+    steps_grid: tuple[int, ...] = CRR_CONVERGENCE_STEPS,
+) -> tuple[CRRConvergencePoint, ...]:
+    """Show the CRR binomial tree's own price stabilising as step count increases.
+
+    This validates the choice of reference step count used for the bias and RMSE
+    comparisons elsewhere: it is a property of the binomial tree itself, independent
+    of any LSMC simulation or replication.
+    """
+    points = []
+    previous_price = None
+    for steps in steps_grid:
+        price = crr_american_put_price(contract, market, steps)
+        change_from_previous = None if previous_price is None else price - previous_price
+        points.append(CRRConvergencePoint(steps, price, change_from_previous))
+        previous_price = price
+    return tuple(points)
+
+
 def estimate_workload(config: SimulationConfig, model: str, replications: int) -> tuple[int, int]:
     """Return (pricing runs, simulated path-steps) without executing a study."""
     path_grid = make_path_count_grid(config.n_paths)

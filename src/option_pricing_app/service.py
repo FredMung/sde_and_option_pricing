@@ -21,6 +21,19 @@ from option_pricing_app.stats import (
 )
 
 CONTINUATION_GRID_SIZE = 300
+# The exercise-boundary crossing test is only evaluated over this central percentile
+# range of each timestep's simulated in-the-money prices, not the full min/max.
+# Diagnosed empirically on this codebase (not drawn from a paper): with a quadratic
+# basis ("1", "S", "S**2"), payoff - continuation is itself a quadratic function of
+# price, which can cross zero twice. In the deep-in-the-money tail -- thinly
+# populated, so the regression is extrapolating rather than interpolating -- that
+# curvature produces a razor-thin spurious second crossing sitting right at the edge
+# of the sampled range, in addition to the genuine, well-supported crossing near the
+# middle of the in-the-money range. The near-the-money end is not the problem: it
+# consistently shows continuation cleanly dominating, as theory predicts. Trimming to
+# the central 90% shrinks -- but does not fully eliminate -- this edge effect, since
+# it is a property of the fitted curve's shape, not of any specific percentile cutoff.
+BOUNDARY_GRID_PERCENTILES = (5.0, 95.0)
 
 
 def create_asset_path_simulator(model: str):
@@ -193,6 +206,18 @@ def estimate_exercise_boundary(
     prices = np.asarray(price_grid, dtype=float)
     payoff = np.asarray(immediate_payoff, dtype=float)
     continuation = np.asarray(continuation_value, dtype=float)
+    # itm_path_count < minimum_required_paths: with too few in-the-money observations
+    # relative to the number of regression coefficients, the fit is under-determined
+    # and can wiggle. minimum_required_paths = max(10, 2 x basis terms) is a cheap
+    # proxy for the same idea Glasserman & Yu (2004, "Number of Paths versus Number of
+    # Basis Functions in American Option Pricing") make rigorous: for polynomial
+    # bases under GBM, the path count needed for a reliable fit grows much faster than
+    # linearly with the number of basis terms. Woo, Liu & Choi (2024, "Leave-one-out
+    # least squares Monte Carlo...") show LSM's look-ahead/overfitting bias is
+    # empirically linear in (basis terms / paths); Longstaff & Schwartz (2001) note
+    # restricting to ITM-only paths keeps this ratio favorable versus using all paths.
+    # The remaining shape checks (ndim, size, matching shapes) are defensive
+    # programming with no literature analogue -- they guard against malformed inputs.
     if (
         itm_path_count < minimum_required_paths
         or prices.ndim != 1
@@ -202,12 +227,18 @@ def estimate_exercise_boundary(
     ):
         return float("nan")
 
+    # Drop non-finite points (can appear near the edge of a polynomial fit's support)
+    # and require a non-degenerate price range. Numerical hygiene, not a modeling rule.
     finite = np.isfinite(prices) & np.isfinite(payoff) & np.isfinite(continuation)
     prices = prices[finite]
     difference = (payoff - continuation)[finite]
     if prices.size < 2 or np.ptp(prices) <= np.finfo(float).eps:
         return float("nan")
 
+    # Treat payoff - continuation as exactly zero within a magnitude-scaled tolerance,
+    # so floating-point noise around a genuine tie doesn't register as a sign change.
+    # A pure numerical-stability guard; if the whole grid is within tolerance of zero,
+    # there is no detectable preference anywhere and no boundary can be identified.
     scale = max(
         1.0,
         float(np.max(np.abs(payoff[finite]))),
@@ -227,6 +258,18 @@ def estimate_exercise_boundary(
         return float("nan")
     nonzero_signs = signs[nonzero_indices]
     transitions = np.flatnonzero(nonzero_signs[:-1] != nonzero_signs[1:])
+    # Exactly one sign transition, running exercise (+) at low price to continuation
+    # (-) at high price: for a single-asset American put, the optimal stopping time
+    # has the closed form tau* = inf{t : S(t) <= b*(t)} for one boundary b*(t)
+    # (Glasserman, "Monte Carlo Methods in Financial Engineering", 2004, Ch. 8, eq.
+    # 8.3 and Fig. 8.1) -- exercise strictly below the boundary, continuation strictly
+    # above, with a single crossing. The same chapter (Sec. 8.2, p. 427) notes this
+    # simple one-boundary structure is specific to a single underlying asset and does
+    # not generalize to multi-asset options, where the exercise region "need not have
+    # a simple structure." Rejecting >1 transitions instead of picking one is a
+    # deliberate choice (see docstring), not something drawn from a paper -- the
+    # papers above establish what the *correct* shape should be, not how to recover
+    # it from a noisy regression that violates that shape.
     if transitions.size != 1:
         return float("nan")
     transition = int(transitions[0])
@@ -234,6 +277,9 @@ def estimate_exercise_boundary(
     right_index = int(nonzero_indices[transition + 1])
     if signs[left_index] != 1 or signs[right_index] != -1:
         return float("nan")
+    # Linear interpolation for the root, falling back to the midpoint if the two
+    # endpoint differences are numerically equal (avoids a near-zero denominator).
+    # Standard root-finding, not a modeling assumption.
     x0, x1 = prices[left_index], prices[right_index]
     d0, d1 = difference[left_index], difference[right_index]
     if np.isclose(d0, d1):
@@ -255,17 +301,27 @@ def _build_lsmc_continuation_diagnostics(
         # out-of-the-money paths have no immediate exercise decision and are excluded.
         in_the_money = price_paths[timestep] < contract.strike
         itm_prices = price_paths[timestep, in_the_money]
+        # No ITM paths at all, or all identical: there is nothing to fit a boundary
+        # against at this timestep. Not a modeling rule, just "no data."
         if itm_prices.size < 2 or np.ptp(itm_prices) <= np.finfo(float).eps:
             continue
 
+        grid_low, grid_high = np.percentile(itm_prices, BOUNDARY_GRID_PERCENTILES)
+        # The trimmed range collapsed to a point (can happen with heavily duplicated
+        # simulated prices). Same numerical-hygiene reasoning as
+        # BOUNDARY_GRID_PERCENTILES above, not a separate modeling rule.
+        if grid_high <= grid_low:
+            continue
         price_grid = np.linspace(
-            float(np.min(itm_prices)),
-            float(np.max(itm_prices)),
+            float(grid_low),
+            float(grid_high),
             CONTINUATION_GRID_SIZE,
         )
         representative_variance = None
         grid_variances = None
         if model.uses_variance:
+            # Defensive: a Heston-fitted model always has variance_paths available
+            # from its caller, so this should not occur in practice.
             if variance_paths is None:
                 continue
             # Heston continuation is C(S, v), so the one-dimensional chart is an
@@ -278,6 +334,10 @@ def _build_lsmc_continuation_diagnostics(
         continuation_value = np.asarray(
             model.predict(price_grid, grid_variances), dtype=float
         )
+        # The regression extrapolated to a non-finite value somewhere on the grid.
+        # Same overfitting/instability concern as the itm_path_count check inside
+        # estimate_exercise_boundary below, just caught after evaluation rather than
+        # before it.
         if not np.all(np.isfinite(continuation_value)):
             continue
         immediate_payoff = np.maximum(contract.strike - price_grid, 0.0)
