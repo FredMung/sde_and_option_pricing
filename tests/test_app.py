@@ -57,7 +57,7 @@ def test_app_starts_and_generates_manual_result():
         "Estimated European put value",
         "Exact European put value",
         "Monte Carlo standard error",
-        "Approximate 95% interval",
+        "Approximate 95% interval (European put value)",
     ]
     assert next(metric for metric in app.metric if metric.label == "Market put value").delta == ""
 
@@ -75,7 +75,7 @@ def test_app_starts_and_generates_manual_result():
         "Estimated European put value",
         "Early-exercise premium (American − European)",
         "Monte Carlo standard error",
-        "Approximate 95% interval",
+        "Approximate 95% interval (American put value)",
     ]
     assert (
         next(

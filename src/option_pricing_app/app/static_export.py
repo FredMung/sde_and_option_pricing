@@ -1,11 +1,11 @@
-"""Vector PDF export for the numerical-studies figures.
+"""Vector PDF export for the numerical-studies and early-exercise-policy figures.
 
 Kaleido (Plotly's static-image renderer) bundles a full browser runtime, which is
-heavy and can be unreliable on constrained hosted environments. The numerical-studies
-figures are built entirely from small scalar summaries -- the same summaries already
-written to the CSV export -- so they are regenerated here as pure-Python vector
-graphics with Matplotlib (an existing project dependency) instead of rasterising or
-converting the interactive Plotly figures.
+heavy and can be unreliable on constrained hosted environments. These figures are
+built entirely from small scalar summaries -- the same summaries already written to
+the CSV exports -- so they are regenerated here as pure-Python vector graphics with
+Matplotlib (an existing project dependency) instead of rasterising or converting the
+interactive Plotly figures.
 """
 
 from __future__ import annotations
@@ -14,16 +14,20 @@ import io
 from collections.abc import Iterable
 
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.backends.backend_pdf import PdfPages
 
+from option_pricing_app.domain import PricingResult, PutContract
+from option_pricing_app.early_exercise import EarlyExercisePolicyRow
 from option_pricing_app.numerical_studies import ExperimentPoint, NumericalStudiesResult
 
 _BLUE = "#5B9BD5"
 _GREEN = "#2CA02C"
+_RED = "#FF3B30"
 _YAXIS_LABEL = "Estimated American put value"
 
 
@@ -90,8 +94,6 @@ def _draw_binomial_reference(ax: Axes, reference: float) -> None:
 
 def _draw_bias_rmse_table(ax: Axes, points: Iterable[ExperimentPoint], title: str) -> None:
     """Tabulate each setting's bias and RMSE against the CRR binomial reference."""
-    ax.axis("off")
-    ax.set_title(title)
     rows = [
         [
             point.setting_label,
@@ -102,15 +104,130 @@ def _draw_bias_rmse_table(ax: Axes, points: Iterable[ExperimentPoint], title: st
         ]
         for point in points
     ]
-    table = ax.table(
-        cellText=rows,
-        colLabels=["Setting", "Mean estimate", "Bias vs CRR", "RMSE vs CRR", "Replications"],
-        loc="center",
-        cellLoc="center",
+    _draw_generic_table(
+        ax,
+        ["Setting", "Mean estimate", "Bias vs CRR", "RMSE vs CRR", "Replications"],
+        rows,
+        title,
     )
+
+
+def _draw_stopping_frequency(ax: Axes, result: PricingResult) -> None:
+    """Bar chart of the share of paths whose selected stopping time is each date."""
+    percentages = result.exercise_percentages
+    early_exercise_percentage = float(np.sum(percentages[:-1]))
+    out_of_the_money_percentage = 100.0 * float(np.mean(result.terminal_payoffs == 0.0))
+    width = (
+        0.8 * float(np.min(np.diff(result.time_grid))) if result.time_grid.size > 1 else 0.01
+    )
+    ax.bar(result.time_grid, percentages, width=width, color=_BLUE)
+    ax.text(
+        0.99, 0.96,
+        f"Exercised before maturity: {early_exercise_percentage:.1f}% of paths\n"
+        f"Out-of-the-money at maturity: {out_of_the_money_percentage:.1f}% of paths",
+        transform=ax.transAxes, ha="right", va="top", fontsize=8,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8, "edgecolor": "lightgray"},
+    )
+    ax.set_title("LSMC stopping policy by exercise time")
+    ax.set_xlabel("Exercise time (years, final point is maturity)")
+    ax.set_ylabel("Percentage of all paths")
+    ax.grid(alpha=0.25)
+
+
+def _draw_exercise_boundary(ax: Axes, result: PricingResult, contract: PutContract) -> None:
+    """Estimated exercise boundary through time, shaded exercise/continuation regions."""
+    times = np.asarray(result.time_grid[1:-1], dtype=float)
+    boundaries = np.full(times.shape, np.nan, dtype=float)
+    for diagnostic in result.continuation_diagnostics:
+        grid_index = diagnostic.timestep - 1
+        if 0 <= grid_index < boundaries.size and np.isfinite(diagnostic.boundary):
+            boundaries[grid_index] = diagnostic.boundary
+    finite = boundaries[np.isfinite(boundaries)]
+    if finite.size:
+        floor = max(0.0, float(np.min(finite)) * 0.95)
+        ceiling = max(contract.strike, float(np.max(finite))) * 1.02
+        ax.fill_between(times, floor, boundaries, color=_RED, alpha=0.08, label="Exercise region (lower S)")
+        ax.fill_between(times, boundaries, ceiling, color=_BLUE, alpha=0.10, label="Continuation region (higher S)")
+        ax.plot(times, boundaries, color=_BLUE, marker="o", markersize=3, linewidth=2, label="Estimated exercise boundary")
+        ax.set_ylim(floor, ceiling)
+    ax.axhline(contract.strike, color=_RED, linestyle="--", linewidth=2, label=f"K = {contract.strike:,.2f}")
+    ax.set_title("Estimated American put early exercise boundary")
+    ax.set_xlabel("Time (years)")
+    ax.set_ylabel("Critical underlying price, S*")
+    ax.grid(alpha=0.25)
+    if times.size:
+        # Matplotlib's autoscale drops the leading run of NaN boundaries (where
+        # continuation dominates and no boundary is fitted) instead of showing it as
+        # blank space, which makes the chart look like a boundary was constructed for
+        # the entire horizon. Pin the x-axis to the full evaluated horizon so that
+        # early blank region is visible, matching the interactive Plotly chart.
+        ax.set_xlim(float(times[0]), float(times[-1]))
+
+
+def _draw_generic_table(ax: Axes, headers: list[str], rows: list[list[str]], title: str) -> None:
+    """Draw a table sized to its content so long labels cannot overlap other columns.
+
+    ``ax.table`` defaults to equal-width, centre-aligned columns; a label column much
+    longer than the others (e.g. a method name) then overflows symmetrically past its
+    own cell and can visually collide with the neighbouring column's values. Sizing
+    columns to content and left-aligning the label column avoids that.
+    """
+    ax.axis("off")
+    ax.set_title(title)
+    table = ax.table(cellText=rows, colLabels=headers, loc="center", cellLoc="center")
     table.auto_set_font_size(False)
     table.set_fontsize(9)
+    table.auto_set_column_width(col=list(range(len(headers))))
+    for row_index in range(len(rows) + 1):  # +1 for the header row
+        table[row_index, 0].set_text_props(ha="left")
+        table[row_index, 0].PAD = 0.02
     table.scale(1, 1.6)
+
+
+def early_exercise_policy_pdf(
+    result: PricingResult,
+    contract: PutContract,
+    policy_rows: tuple[EarlyExercisePolicyRow, ...],
+) -> bytes:
+    """Render the early-exercise-policy figures and summary table as a vector PDF."""
+    buffer = io.BytesIO()
+    with PdfPages(buffer) as pdf:
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        _draw_stopping_frequency(ax, result)
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        if result.continuation_diagnostics:
+            fig, ax = plt.subplots(figsize=(8, 4.5))
+            _draw_exercise_boundary(ax, result, contract)
+            ax.legend(loc="best", fontsize=8)
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(9.5, 3.5))
+        rows = [
+            [
+                row.method,
+                f"{row.american_value:.4f}"
+                + (f" ({row.american_standard_error:.4f})" if row.american_standard_error is not None else ""),
+                f"{row.european_value:.4f}",
+                f"{row.early_exercise_value:.4f}",
+            ]
+            for row in policy_rows
+        ]
+        _draw_generic_table(
+            ax,
+            ["Method", "American (s.e.)", "European", "Early exercise value"],
+            rows,
+            "Estimated value from early exercise",
+        )
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    return buffer.getvalue()
 
 
 def numerical_studies_pdf(studies: NumericalStudiesResult) -> bytes:

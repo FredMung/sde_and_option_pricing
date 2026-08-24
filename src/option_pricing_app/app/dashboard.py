@@ -19,7 +19,10 @@ from option_pricing_app.app.charts import (
     terminal_figure,
     variance_paths_figure,
 )
-from option_pricing_app.app.static_export import numerical_studies_pdf
+from option_pricing_app.app.static_export import (
+    early_exercise_policy_pdf,
+    numerical_studies_pdf,
+)
 from option_pricing_app.domain import (
     HESTON_BASIS_TERMS,
     PRICE_BASIS_TERMS,
@@ -29,6 +32,16 @@ from option_pricing_app.domain import (
     PricingResult,
     PutContract,
     SimulationConfig,
+)
+from option_pricing_app.early_exercise import (
+    VALIDATION_MATURITY_MULTIPLIERS,
+    VALIDATION_MONEYNESS_GRID,
+    VALIDATION_VOLATILITY_MULTIPLIERS,
+    ValidationRow,
+    build_early_exercise_policy_table,
+    early_exercise_policy_to_csv,
+    run_numerical_validation_study,
+    validation_study_to_csv,
 )
 from option_pricing_app.market_data import (
     MarketDataError,
@@ -134,6 +147,17 @@ def cached_numerical_studies(
     )
 
 
+@st.cache_data(show_spinner=False)
+def cached_numerical_validation(
+    contract: PutContract,
+    market: MarketInputs,
+    config: SimulationConfig,
+    base_seed: int,
+) -> tuple[ValidationRow, ...]:
+    """Cache the Table-1-style parameter-sweep validation for an identical spec."""
+    return run_numerical_validation_study(contract, market, config, base_seed)
+
+
 def run_dashboard() -> None:
     st.set_page_config(page_title="SDE Option-Pricing Lab", page_icon="📈", layout="wide")
     st.title("SDE Option-Pricing Lab")
@@ -168,6 +192,8 @@ def run_dashboard() -> None:
         result, dashboard_inputs = output
         _headline_results(result, dashboard_inputs)
         _numerical_studies(dashboard_inputs)
+        _early_exercise_policy(result, dashboard_inputs)
+        _numerical_validation(dashboard_inputs)
         _supplementary_results(result, dashboard_inputs)
     else:
         st.info("Choose assumptions in the sidebar, then generate a simulation.")
@@ -618,7 +644,20 @@ def _headline_results(result: PricingResult, inputs: DashboardInputs) -> None:
             else:
                 st.metric("Exact European put value", "Not implemented for Heston")
         st.metric("Monte Carlo standard error", f"{result.standard_error:,.4f}")
-        st.metric("Approximate 95% interval", f"[{low:,.4f}, {high:,.4f}]")
+        priced_value_label = (
+            "American put value" if inputs.exercise_style is ExerciseStyle.AMERICAN
+            else "European put value"
+        )
+        st.metric(
+            f"Approximate 95% interval ({priced_value_label})",
+            f"[{low:,.4f}, {high:,.4f}]",
+            help=(
+                f"Normal approximation for the estimated {priced_value_label}: "
+                "price ± 1.96 × Monte Carlo standard error, clipped to be "
+                "non-negative. Not a confidence interval for the market put value "
+                "or for any other metric on this page."
+            ),
+        )
 
 
 def _supplementary_results(result: PricingResult, inputs: DashboardInputs) -> None:
@@ -670,47 +709,6 @@ def _supplementary_results(result: PricingResult, inputs: DashboardInputs) -> No
     left, right = st.columns(2)
     left.plotly_chart(terminal_figure(result, inputs.contract), use_container_width=True)
     right.plotly_chart(payoff_figure(result, inputs.contract), use_container_width=True)
-    if result.exercise_percentages is not None:
-        st.plotly_chart(exercise_figure(result), use_container_width=True)
-        st.caption(
-            "Each path is counted once at its earliest selected exercise time; paths "
-            "that expire out of the money are not counted. Being in the money does "
-            "not automatically trigger exercise because continuation may be more "
-            "valuable. These percentages are risk-neutral model estimates, not a "
-            "forecast of how many investors will exercise."
-        )
-    if result.continuation_diagnostics:
-        st.plotly_chart(
-            exercise_boundary_figure(result, inputs.contract),
-            use_container_width=True,
-        )
-        boundary_caption = (
-            "Each point is obtained by solving immediate payoff = fitted continuation "
-            "value on the central 5th-95th percentile of that timestep's in-the-money "
-            "prices; the thinly populated outer tails are excluded because the "
-            "regression is extrapolating rather than interpolating there. A point is "
-            "shown only when there are sufficient in-the-money observations and exactly "
-            "one exercise-to-continuation sign change within that range. Missing "
-            "timesteps had too few observations, no in-range crossing, or several "
-            "crossings. No boundary is extrapolated beyond the trimmed range or "
-            "selected arbitrarily from multiple roots. Gaps are retained between "
-            "omitted timesteps."
-        )
-        if any(
-            diagnostic.representative_variance is not None
-            for diagnostic in result.continuation_diagnostics
-        ):
-            boundary_caption += (
-                " Because Heston continuation depends on both price and variance, each "
-                "displayed boundary is conditional on that timestep's median "
-                "in-the-money variance."
-            )
-        st.caption(boundary_caption)
-    elif result.continuation_diagnostics == ():
-        st.info(
-            "No LSMC continuation regression could be visualised. Increase the number "
-            "of time steps or choose a contract with in-the-money simulated paths."
-        )
     st.plotly_chart(cash_flow_figure(result), use_container_width=True)
     if result.exercise_style is ExerciseStyle.AMERICAN:
         st.caption(
@@ -759,6 +757,128 @@ def _supplementary_results(result: PricingResult, inputs: DashboardInputs) -> No
         )
     st.subheader("Inputs and provenance")
     st.dataframe(pd.DataFrame(rows, columns=["Input", "Value or source"]), hide_index=True, use_container_width=True)
+
+
+def _early_exercise_policy(result: PricingResult, inputs: DashboardInputs) -> None:
+    """Render the fitted stopping policy, its boundary, and the early-exercise value.
+
+    Structured after Longstaff & Schwartz (2001), Table 1: the American value, the
+    European value and their difference (the early exercise value) are reported side
+    by side for an independent reference and for the LSMC simulation.
+    """
+    st.divider()
+    st.subheader("Early-Exercise Policy")
+    if inputs.exercise_style is not ExerciseStyle.AMERICAN:
+        st.info("The early-exercise policy is available when the exercise style is American.")
+        return
+    st.caption(
+        "The fitted LSMC stopping rule for this run: when it exercises, where the "
+        "boundary between exercise and continuation sits, and how much value the "
+        "early-exercise feature is estimated to add."
+    )
+
+    st.plotly_chart(exercise_figure(result), use_container_width=True)
+    st.caption(
+        "Each path is counted once at its earliest selected exercise time; paths "
+        "that expire out of the money are not counted. Being in the money does "
+        "not automatically trigger exercise because continuation may be more "
+        "valuable. These percentages are risk-neutral model estimates, not a "
+        "forecast of how many investors will exercise."
+    )
+    if result.continuation_diagnostics:
+        st.plotly_chart(
+            exercise_boundary_figure(result, inputs.contract),
+            use_container_width=True,
+        )
+        boundary_caption = (
+            "Each point is obtained by solving immediate payoff = fitted continuation "
+            "value on the central 5th-95th percentile of that timestep's in-the-money "
+            "prices; the thinly populated outer tails are excluded because the "
+            "regression is extrapolating rather than interpolating there. A point is "
+            "shown only when there are sufficient in-the-money observations and exactly "
+            "one exercise-to-continuation sign change within that range. Missing "
+            "timesteps had too few observations, no in-range crossing, or several "
+            "crossings. No boundary is extrapolated beyond the trimmed range or "
+            "selected arbitrarily from multiple roots. Gaps are retained between "
+            "omitted timesteps."
+        )
+        if any(
+            diagnostic.representative_variance is not None
+            for diagnostic in result.continuation_diagnostics
+        ):
+            boundary_caption += (
+                " Because Heston continuation depends on both price and variance, each "
+                "displayed boundary is conditional on that timestep's median "
+                "in-the-money variance."
+            )
+        st.caption(boundary_caption)
+    elif result.continuation_diagnostics == ():
+        st.info(
+            "No LSMC continuation regression could be visualised. Increase the number "
+            "of time steps or choose a contract with in-the-money simulated paths."
+        )
+
+    st.markdown("#### Estimated value from early exercise")
+    try:
+        policy_rows = build_early_exercise_policy_table(
+            result, inputs.contract, inputs.market, inputs.model
+        )
+    except (ValueError, FloatingPointError) as exc:
+        st.error(f"The early-exercise policy table could not be computed: {exc}")
+        return
+    policy_table = pd.DataFrame(
+        [
+            {
+                "Method": row.method,
+                "American": row.american_value,
+                "American (s.e.)": row.american_standard_error,
+                "European": row.european_value,
+                "Early exercise value": row.early_exercise_value,
+            }
+            for row in policy_rows
+        ]
+    )
+    st.dataframe(policy_table, hide_index=True, use_container_width=True)
+    if inputs.model == "GBM":
+        difference = policy_rows[0].early_exercise_value - policy_rows[1].early_exercise_value
+        st.caption(
+            "The early exercise value is the American value minus the European value "
+            "(Longstaff & Schwartz 2001, Table 1). The reference row uses a CRR "
+            f"binomial tree ({CRR_BINOMIAL_STEPS:,} steps) and the closed-form "
+            "Black–Scholes price in place of the paper's finite-difference benchmark. "
+            f"Difference in early exercise value (reference − simulation): {difference:+,.4f}."
+        )
+    else:
+        st.caption(
+            "No independent reference row is shown for Heston: the CRR binomial tree "
+            "and the closed-form European price both assume constant-volatility "
+            "lognormal dynamics, so neither is a valid benchmark here."
+        )
+
+    download_csv, download_pdf = st.columns(2)
+    download_csv.download_button(
+        "Download early-exercise policy (CSV)",
+        data=early_exercise_policy_to_csv(policy_rows),
+        file_name="early_exercise_policy.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    try:
+        policy_pdf_bytes = early_exercise_policy_pdf(result, inputs.contract, policy_rows)
+    except (ValueError, RuntimeError) as exc:
+        download_pdf.error(f"The PDF export could not be generated: {exc}")
+    else:
+        download_pdf.download_button(
+            "Download early-exercise policy charts (PDF)",
+            data=policy_pdf_bytes,
+            file_name="early_exercise_policy.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+        st.caption(
+            "The PDF is a vector figure regenerated directly from this run's summary "
+            "data, not a rendering of the interactive Plotly figures."
+        )
 
 
 def _numerical_studies(inputs: DashboardInputs) -> None:
@@ -958,17 +1078,98 @@ def _render_numerical_studies(studies: NumericalStudiesResult) -> None:
         mime="text/csv",
         use_container_width=True,
     )
-    download_pdf.download_button(
-        "Download numerical studies charts (PDF)",
-        data=numerical_studies_pdf(studies),
-        file_name="numerical_studies.pdf",
-        mime="application/pdf",
-        use_container_width=True,
-    )
+    try:
+        studies_pdf_bytes = numerical_studies_pdf(studies)
+    except (ValueError, RuntimeError) as exc:
+        download_pdf.error(f"The PDF export could not be generated: {exc}")
+    else:
+        download_pdf.download_button(
+            "Download numerical studies charts (PDF)",
+            data=studies_pdf_bytes,
+            file_name="numerical_studies.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+        st.caption(
+            "The PDF is a vector figure regenerated directly from the summary "
+            "statistics above (the same data as the CSV export), not a rendering of "
+            "the interactive Plotly figures, which would require the optional "
+            "Kaleido dependency."
+        )
+
+
+def _numerical_validation(inputs: DashboardInputs) -> None:
+    """Table-1-style parameter-sweep validation of LSMC American pricing under GBM.
+
+    Mirrors Longstaff & Schwartz (2001), Table 1: the strike and risk-free rate are
+    held fixed while spot, volatility and maturity are swept around the current
+    inputs, comparing LSMC against an independent CRR binomial / closed-form
+    reference at each point.
+    """
+    st.divider()
+    st.subheader("Numerical validation")
     st.caption(
-        "The PDF is a vector figure regenerated directly from the summary statistics "
-        "above (the same data as the CSV export), not a rendering of the interactive "
-        "Plotly figures, which would require the optional Kaleido dependency."
+        "Validates LSMC American pricing against an independent reference across a "
+        "grid of spot prices, volatilities and maturities anchored to the current "
+        "strike and risk-free rate -- the same design as Longstaff & Schwartz (2001), "
+        "Table 1, with a CRR binomial tree standing in for their finite-difference "
+        "benchmark. GBM only."
+    )
+    if inputs.exercise_style is not ExerciseStyle.AMERICAN or inputs.model != "GBM":
+        st.info(
+            "Numerical validation is available for American exercise under the GBM "
+            "model, where an independent CRR binomial / closed-form reference exists."
+        )
+        return
+
+    base_seed = st.session_state.get("numerical_studies_base_seed")
+    if base_seed is None:
+        base_seed = generate_base_seed()
+        st.session_state["numerical_studies_base_seed"] = base_seed
+    try:
+        with st.spinner("Running the validation grid..."):
+            validation_rows = cached_numerical_validation(
+                inputs.contract, inputs.market, inputs.simulation, base_seed
+            )
+    except (ValueError, FloatingPointError) as exc:
+        st.error(f"The numerical validation could not be completed: {exc}")
+        return
+
+    validation_table = pd.DataFrame(
+        [
+            {
+                "Spot": row.spot,
+                "Volatility": row.volatility,
+                "Maturity (years)": row.maturity,
+                "CRR American": row.crr_american,
+                "Closed-form European": row.closed_form_european,
+                "CRR early exercise value": row.crr_early_exercise_value,
+                "LSMC American": row.lsmc_american,
+                "LSMC (s.e.)": row.lsmc_standard_error,
+                "LSMC early exercise value": row.lsmc_early_exercise_value,
+                "Difference in early exercise value": row.difference_in_early_exercise_value,
+            }
+            for row in validation_rows
+        ]
+    )
+    st.dataframe(validation_table, hide_index=True, use_container_width=True)
+    absolute_differences = validation_table["Difference in early exercise value"].abs()
+    st.caption(
+        f"Spot is swept at {', '.join(f'{m:.0%}' for m in VALIDATION_MONEYNESS_GRID)} "
+        "of the strike; volatility and maturity are each swept at the current value "
+        "and twice that value, for "
+        f"{len(VALIDATION_MONEYNESS_GRID) * len(VALIDATION_VOLATILITY_MULTIPLIERS) * len(VALIDATION_MATURITY_MULTIPLIERS)} "
+        "rows. Each row is a single simulation with its own derived seed, not a "
+        "replication average, so (s.e.) is that one run's Monte Carlo standard "
+        "error. Median |difference in early exercise value|: "
+        f"{absolute_differences.median():.4f}; maximum: {absolute_differences.max():.4f}."
+    )
+    st.download_button(
+        "Download numerical validation (CSV)",
+        data=validation_study_to_csv(validation_rows),
+        file_name="numerical_validation.csv",
+        mime="text/csv",
+        use_container_width=True,
     )
 
 
