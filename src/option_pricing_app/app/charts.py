@@ -15,6 +15,7 @@ from option_pricing_app.numerical_studies import (
     ExperimentPoint,
     PathCountStudyResult,
 )
+from option_pricing_app.policy_validation import PairedValidationStudyResult
 
 PRIMARY_BLUE = "#5B9BD5"
 BLUE_PATH = "rgba(91, 155, 213, 0.28)"
@@ -334,11 +335,14 @@ def _repeated_study_figure(
     title: str,
     xaxis_title: str,
 ) -> go.Figure:
-    """Plot repeated full-pricing estimates and empirical replication quantiles.
+    """Plot repeated out-of-sample policy estimates and empirical replication quantiles.
 
-    Only appropriate for settings with a genuine continuous ordering (path count,
-    exercise-grid size); the connecting line and band imply interpolation between
-    x-values, which is not valid for categorical settings such as basis choice.
+    Each point is a frozen LSMC policy fitted on training paths and evaluated,
+    without refitting, on independently simulated validation paths (see
+    ``lsmc_policy.py``) -- not a same-sample price. Only appropriate for settings
+    with a genuine continuous ordering (path count, exercise-grid size); the
+    connecting line and band imply interpolation between x-values, which is not
+    valid for categorical settings such as basis choice.
     """
     x_values = [point.setting_value for point in points]
     lower = np.asarray([point.lower_empirical_quantile for point in points])
@@ -378,18 +382,18 @@ def _repeated_study_figure(
         for run in point.runs:
             run_x.append(x_value)
             run_y.append(run.estimated_price)
-            run_seed.append(run.seed)
+            run_seed.append(run.training_seed)
     figure.add_trace(
         go.Scatter(
             x=run_x,
             y=run_y,
             mode="markers",
             marker={"size": 6, "color": PRIMARY_BLUE, "opacity": 0.28},
-            name="Individual replication",
+            name="Individual replication (out-of-sample)",
             customdata=run_seed,
             hovertemplate=(
-                "Setting=%{x}<br>Estimate=%{y:.4f}<br>Seed=%{customdata}"
-                "<extra></extra>"
+                "Setting=%{x}<br>Out-of-sample estimate=%{y:.4f}<br>"
+                "Training seed=%{customdata}<extra></extra>"
             ),
         )
     )
@@ -400,14 +404,14 @@ def _repeated_study_figure(
             mode="lines+markers",
             line={"width": 3, "color": PRIMARY_BLUE},
             marker={"size": 8, "color": PRIMARY_BLUE},
-            name="Mean across replications",
+            name="Mean out-of-sample estimate",
             hovertemplate="Setting=%{x}<br>Mean=%{y:.4f}<extra></extra>",
         )
     )
     figure.update_layout(
         title=title,
         xaxis_title=xaxis_title,
-        yaxis_title="Estimated American put value",
+        yaxis_title="Out-of-sample estimated American put value",
         template="plotly_white",
         height=430,
         hovermode="x unified",
@@ -416,11 +420,16 @@ def _repeated_study_figure(
 
 
 def path_count_study_figure(study: PathCountStudyResult) -> go.Figure:
-    """Plot true LSMC path-count convergence from complete repeated reruns."""
+    """Plot out-of-sample LSMC path-count convergence from complete repeated reruns.
+
+    Tests whether increasing the number of training paths improves the fitted
+    policy's performance, isolated from validation noise by holding the independent
+    evaluation set fixed at the currently selected path count across all settings.
+    """
     figure = _repeated_study_figure(
         study.points,
-        "Path-count convergence study",
-        "Number of paths used to fit and value LSMC",
+        "Path-count convergence study (out-of-sample)",
+        "Number of training paths used to fit LSMC",
     )
     final = study.points[-1]
     figure.add_trace(
@@ -446,10 +455,14 @@ def path_count_study_figure(study: PathCountStudyResult) -> go.Figure:
 
 
 def exercise_grid_study_figure(study: ExerciseGridStudyResult) -> go.Figure:
-    """Plot repeated American estimates as the permitted exercise grid is refined."""
+    """Plot repeated out-of-sample American estimates as the exercise grid is refined.
+
+    Fitting and evaluating out-of-sample here prevents same-sample reuse from being
+    mistaken for a genuine exercise-grid effect.
+    """
     figure = _repeated_study_figure(
         study.points,
-        "Exercise-grid convergence study",
+        "Exercise-grid convergence study (out-of-sample)",
         "Number of exercise dates",
     )
     if study.binomial_reference is not None:
@@ -465,8 +478,12 @@ def exercise_grid_study_figure(study: ExerciseGridStudyResult) -> go.Figure:
 
 
 def basis_sensitivity_study_figure(study: BasisSensitivityStudyResult) -> go.Figure:
-    """Plot repeated American estimates across documented LSMC basis choices.
+    """Plot repeated out-of-sample American estimates across LSMC basis choices.
 
+    Each point is a frozen LSMC policy fitted on training paths and evaluated,
+    without refitting, on independently simulated validation paths (see
+    ``lsmc_policy.py``) -- particularly important here, since a richer basis can fit
+    the training paths well without improving the policy's out-of-sample performance.
     Basis specifications are categorical and unordered, so unlike the path-count and
     exercise-grid studies this draws independent points per basis rather than a
     connected line or shaded band, which would falsely imply a continuous ordering.
@@ -483,17 +500,18 @@ def basis_sensitivity_study_figure(study: BasisSensitivityStudyResult) -> go.Fig
         for run in point.runs:
             run_x.append(label)
             run_y.append(run.estimated_price)
-            run_seed.append(run.seed)
+            run_seed.append(run.training_seed)
     figure.add_trace(
         go.Scatter(
             x=run_x,
             y=run_y,
             mode="markers",
             marker={"size": 6, "color": PRIMARY_BLUE, "opacity": 0.28},
-            name="Individual replication",
+            name="Individual replication (out-of-sample)",
             customdata=run_seed,
             hovertemplate=(
-                "Basis=%{x}<br>Estimate=%{y:.4f}<br>Seed=%{customdata}<extra></extra>"
+                "Basis=%{x}<br>Out-of-sample estimate=%{y:.4f}<br>"
+                "Training seed=%{customdata}<extra></extra>"
             ),
         )
     )
@@ -517,7 +535,7 @@ def basis_sensitivity_study_figure(study: BasisSensitivityStudyResult) -> go.Fig
                 "thickness": 2,
                 "width": 8,
             },
-            name="Mean, 95% empirical replication interval",
+            name="Mean out-of-sample estimate, 95% empirical replication interval",
             hovertemplate=(
                 "Basis=%{x}<br>Mean=%{y:.4f}<br>2.5%=%{customdata[0]:.4f}<br>"
                 "97.5%=%{customdata[1]:.4f}<extra></extra>"
@@ -535,31 +553,115 @@ def basis_sensitivity_study_figure(study: BasisSensitivityStudyResult) -> go.Fig
             annotation_position="bottom right",
         )
     figure.update_layout(
-        title="LSMC basis-function sensitivity",
+        title="LSMC basis-function sensitivity (out-of-sample)",
         xaxis_title="Basis specification",
         xaxis={"type": "category"},
-        yaxis_title="Estimated American put value",
+        yaxis_title="Out-of-sample estimated American put value",
         template="plotly_white",
         height=430,
     )
     return figure
 
 
-def exercise_figure(result: PricingResult) -> go.Figure:
-    """Plot the share of all paths whose selected stopping time is each time point."""
-    if result.exercise_percentages is None:
-        raise ValueError("Exercise frequencies are only available for American options")
-    early_exercise_percentage = float(np.sum(result.exercise_percentages[:-1]))
-    out_of_the_money_percentage = 100.0 * float(np.mean(result.terminal_payoffs == 0.0))
+def paired_replication_figure(study: PairedValidationStudyResult) -> go.Figure:
+    """Plot same-sample vs independent policy value for each paired replication.
+
+    One marker per replication for the same-sample estimate (fit and evaluated on
+    the same training paths) and one for the independent estimate (that frozen
+    policy evaluated on separately simulated valuation paths), joined by a thin
+    line. The line is meaningful here -- unlike in the path-count/exercise-grid
+    charts -- because it connects two results computed from the same training and
+    valuation seed pair, not because replication number has a continuous ordering.
+    The matched-exercise-grid CRR reference is drawn as a horizontal line; the
+    continuous-exercise CRR value is reported in the summary table instead of a
+    second line, to keep the chart from getting crowded.
+    """
+    replications = [row.replication for row in study.replications]
+    same_sample = [row.same_sample_estimate for row in study.replications]
+    independent = [row.independent_estimate for row in study.replications]
+    training_seeds = [row.training_seed for row in study.replications]
+    valuation_seeds = [row.valuation_seed for row in study.replications]
+
+    figure = go.Figure()
+    for replication, same, indep in zip(replications, same_sample, independent, strict=True):
+        figure.add_trace(
+            go.Scatter(
+                x=[replication, replication],
+                y=[same, indep],
+                mode="lines",
+                line={"width": 1, "color": "rgba(91, 155, 213, 0.5)"},
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+    figure.add_trace(
+        go.Scatter(
+            x=replications,
+            y=same_sample,
+            mode="markers",
+            marker={"size": 9, "color": REFERENCE_RED, "symbol": "circle"},
+            name="Same-sample estimate",
+            customdata=training_seeds,
+            hovertemplate=(
+                "Replication=%{x}<br>Same-sample=%{y:.4f}<br>Training seed=%{customdata}"
+                "<extra></extra>"
+            ),
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=replications,
+            y=independent,
+            mode="markers",
+            marker={"size": 9, "color": PRIMARY_BLUE, "symbol": "diamond"},
+            name="Independent (out-of-sample) estimate",
+            customdata=valuation_seeds,
+            hovertemplate=(
+                "Replication=%{x}<br>Independent=%{y:.4f}<br>Valuation seed=%{customdata}"
+                "<extra></extra>"
+            ),
+        )
+    )
+    figure.add_hline(
+        y=study.matched_grid_crr,
+        line_dash="dot",
+        line_color=BINOMIAL_GREEN,
+        line_width=3,
+        annotation_text="Matched-grid CRR reference",
+        annotation_position="bottom right",
+    )
+    figure.update_layout(
+        title="Paired replication validation: same-sample vs independent policy value",
+        xaxis_title="Replication",
+        xaxis={"dtick": 1},
+        yaxis_title="Estimated American put value",
+        template="plotly_white",
+        height=440,
+        hovermode="closest",
+    )
+    return figure
+
+
+def exercise_figure(
+    time_grid: np.ndarray,
+    exercise_percentages: np.ndarray,
+    out_of_the_money_percentage: float,
+) -> go.Figure:
+    """Plot the share of independent validation paths exercised at each time point.
+
+    Takes explicit arrays rather than a ``PricingResult`` so the same chart can be
+    fed the out-of-sample stopping statistics from an ``IndependentPolicyEvaluation``
+    (see ``lsmc_policy.py``) -- how often the frozen fitted policy exercises when
+    applied to new paths, not how often it exercised on its own training data.
+    """
+    early_exercise_percentage = float(np.sum(exercise_percentages[:-1]))
     bar_width = (
-        0.8 * float(np.min(np.diff(result.time_grid)))
-        if result.time_grid.size > 1
-        else None
+        0.8 * float(np.min(np.diff(time_grid))) if time_grid.size > 1 else None
     )
     figure = go.Figure(
         go.Bar(
-            x=result.time_grid,
-            y=result.exercise_percentages,
+            x=time_grid,
+            y=exercise_percentages,
             width=bar_width,
             marker_color=PRIMARY_BLUE,
             hovertemplate="t=%{x:.3f} years<br>Paths exercised=%{y:.2f}%<extra></extra>",
@@ -579,9 +681,9 @@ def exercise_figure(result: PricingResult) -> go.Figure:
         showarrow=False,
     )
     figure.update_layout(
-        title="LSMC stopping policy by exercise time",
+        title="LSMC stopping policy by exercise time (out-of-sample)",
         xaxis_title="Exercise time (years, final point is maturity)",
-        yaxis_title="Percentage of all paths",
+        yaxis_title="Percentage of independent validation paths",
         yaxis={"ticksuffix": "%"},
         template="plotly_white",
         height=430,

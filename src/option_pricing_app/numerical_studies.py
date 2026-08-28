@@ -1,15 +1,18 @@
 """Repeated-run numerical studies built on the existing pricing service.
 
-This module deliberately contains no Streamlit or Plotly imports.  Each experiment
-calls ``price_put`` afresh, so every scalar estimate comes from newly simulated paths
-and a newly fitted LSMC stopping policy.  Full path arrays are discarded immediately.
+This module deliberately contains no Streamlit or Plotly imports. Each replication
+fits the LSMC policy on a freshly simulated *training* path set, then evaluates that
+frozen policy -- without refitting -- on an independently simulated *validation* path
+set (see ``lsmc_policy.py``). Reporting the out-of-sample estimate rather than the
+same-sample one avoids mistaking in-sample fit for genuine sensitivity: a same-sample
+estimate can look better purely because the stopping rule was chosen to fit that exact
+data. Full path arrays are discarded immediately after each fit/evaluation.
 """
 
 from __future__ import annotations
 
 import csv
 import io
-from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -19,11 +22,16 @@ from option_pricing_app.domain import (
     ExerciseStyle,
     HestonInputs,
     MarketInputs,
-    PricingResult,
     PutContract,
     SimulationConfig,
 )
-from option_pricing_app.service import crr_american_put_price, price_put
+from option_pricing_app.lsmc_policy import (
+    evaluate_independent_policy,
+    fit_lsmc_policy,
+    generate_paths,
+)
+from option_pricing_app.policy_validation import derive_paired_seeds
+from option_pricing_app.service import crr_american_put_price
 
 PATH_COUNT_CANDIDATES = (100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000)
 EXERCISE_GRID_CANDIDATES = (5, 10, 25, 50, 100, 250, 500, 1_000)
@@ -31,7 +39,8 @@ EXERCISE_GRID_CANDIDATES = (5, 10, 25, 50, 100, 250, 500, 1_000)
 
 @dataclass(frozen=True)
 class ExperimentRun:
-    seed: int
+    training_seed: int
+    valuation_seed: int
     estimated_price: float
     standard_error: float
 
@@ -53,7 +62,7 @@ class ExperimentPoint:
 @dataclass(frozen=True)
 class PathCountStudyResult:
     base_seed: int
-    derived_seeds: tuple[int, ...]
+    derived_seeds: tuple[tuple[int, int], ...]
     points: tuple[ExperimentPoint, ...]
     contract: PutContract
     market: MarketInputs
@@ -67,7 +76,7 @@ class PathCountStudyResult:
 @dataclass(frozen=True)
 class ExerciseGridStudyResult:
     base_seed: int
-    derived_seeds: tuple[int, ...]
+    derived_seeds: tuple[tuple[int, int], ...]
     points: tuple[ExperimentPoint, ...]
     contract: PutContract
     market: MarketInputs
@@ -81,7 +90,7 @@ class ExerciseGridStudyResult:
 @dataclass(frozen=True)
 class BasisSensitivityStudyResult:
     base_seed: int
-    derived_seeds: tuple[int, ...]
+    derived_seeds: tuple[tuple[int, int], ...]
     points: tuple[ExperimentPoint, ...]
     contract: PutContract
     market: MarketInputs
@@ -97,12 +106,6 @@ class NumericalStudiesResult:
     path_count: PathCountStudyResult
     exercise_grid: ExerciseGridStudyResult | None
     basis_sensitivity: BasisSensitivityStudyResult
-
-
-PricingFunction = Callable[
-    [PutContract, MarketInputs, SimulationConfig, ExerciseStyle, str, HestonInputs | None],
-    PricingResult,
-]
 
 
 def make_path_count_grid(max_paths: int) -> tuple[int, ...]:
@@ -121,22 +124,17 @@ def make_exercise_grid(max_steps: int) -> tuple[int, ...]:
     )
 
 
-def derive_replication_seeds(base_seed: int, replications: int) -> tuple[int, ...]:
-    """Derive deterministic independent child seeds using NumPy SeedSequence."""
-    if base_seed < 0:
-        raise ValueError("base_seed must be non-negative")
-    if not 3 <= replications <= 20:
-        raise ValueError("replications must be between 3 and 20")
-    root = np.random.SeedSequence(base_seed)
-    return tuple(
-        int(child.generate_state(1, dtype=np.uint32)[0])
-        for child in root.spawn(replications)
-    )
-
-
 def generate_base_seed() -> int:
     """Generate and return an explicit seed for an initially unseeded study."""
     return int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
+
+
+def derive_validation_seed(base_seed: int) -> int:
+    """Derive one deterministic child seed for a single out-of-sample evaluation."""
+    if base_seed < 0:
+        raise ValueError("base_seed must be non-negative")
+    child = np.random.SeedSequence(base_seed).spawn(1)[0]
+    return int(child.generate_state(1, dtype=np.uint32)[0])
 
 
 def basis_specifications(model: str, selected: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
@@ -195,26 +193,38 @@ def _run_point(
     market: MarketInputs,
     model: str,
     heston_inputs: HestonInputs | None,
-    path_count: int,
+    training_path_count: int,
+    validation_path_count: int,
     time_steps: int,
     basis_terms: tuple[str, ...],
-    seeds: tuple[int, ...],
-    pricing_function: PricingFunction,
+    seed_pairs: tuple[tuple[int, int], ...],
+    fit_policy_function,
+    generate_paths_function,
+    evaluate_function,
     binomial_reference: float | None,
 ) -> ExperimentPoint:
     runs = []
-    for seed in seeds:
-        # price_put performs the complete simulation, continuation regressions,
-        # stopping decisions and time-zero averaging for this setting and seed.
-        result = pricing_function(
-            contract,
-            market,
-            SimulationConfig(path_count, time_steps, seed, 1, basis_terms),
-            ExerciseStyle.AMERICAN,
-            model,
-            heston_inputs,
+    for training_seed, valuation_seed in seed_pairs:
+        # Fit the LSMC stopping policy on the training paths, then evaluate that
+        # frozen policy -- never refit -- on an independently simulated validation
+        # set. The out-of-sample estimate is what makes this a genuine sensitivity
+        # study rather than an artifact of same-sample in-sample fit.
+        training_config = SimulationConfig(
+            training_path_count, time_steps, training_seed, 1, basis_terms
         )
-        runs.append(ExperimentRun(seed, result.price, result.standard_error))
+        policy = fit_policy_function(contract, market, training_config, model, heston_inputs)
+        validation_config = SimulationConfig(
+            validation_path_count, time_steps, valuation_seed, 1, basis_terms
+        )
+        validation_paths, validation_variance_paths = generate_paths_function(
+            contract, market, validation_config, model, heston_inputs
+        )
+        evaluation = evaluate_function(policy, validation_paths, validation_variance_paths)
+        runs.append(
+            ExperimentRun(
+                training_seed, valuation_seed, evaluation.mean_estimate, evaluation.standard_error
+            )
+        )
     return _aggregate_point(setting_value, setting_label, basis_terms, runs, binomial_reference)
 
 
@@ -226,9 +236,14 @@ def run_path_count_study(
     heston_inputs: HestonInputs | None,
     base_seed: int,
     replications: int,
-    pricing_function: PricingFunction = price_put,
+    fit_policy_function=fit_lsmc_policy,
+    generate_paths_function=generate_paths,
+    evaluate_function=evaluate_independent_policy,
 ) -> PathCountStudyResult:
-    seeds = derive_replication_seeds(base_seed, replications)
+    # Training path count is the setting under test; the validation set stays fixed
+    # at the currently selected path count so validation noise does not confound
+    # with the training-size effect being measured.
+    seed_pairs = derive_paired_seeds(base_seed, replications)
     binomial_reference = crr_american_put_price(contract, market) if model == "GBM" else None
     points = tuple(
         _run_point(
@@ -238,18 +253,21 @@ def run_path_count_study(
             market=market,
             model=model,
             heston_inputs=heston_inputs,
-            path_count=path_count,
+            training_path_count=path_count,
+            validation_path_count=config.n_paths,
             time_steps=config.n_steps,
             basis_terms=config.basis_terms,
-            seeds=seeds,
-            pricing_function=pricing_function,
+            seed_pairs=seed_pairs,
+            fit_policy_function=fit_policy_function,
+            generate_paths_function=generate_paths_function,
+            evaluate_function=evaluate_function,
             binomial_reference=binomial_reference,
         )
         for path_count in make_path_count_grid(config.n_paths)
     )
     return PathCountStudyResult(
         base_seed,
-        seeds,
+        seed_pairs,
         points,
         contract,
         market,
@@ -269,11 +287,16 @@ def run_exercise_grid_study(
     heston_inputs: HestonInputs | None,
     base_seed: int,
     replications: int,
-    pricing_function: PricingFunction = price_put,
+    fit_policy_function=fit_lsmc_policy,
+    generate_paths_function=generate_paths,
+    evaluate_function=evaluate_independent_policy,
 ) -> ExerciseGridStudyResult:
     if model != "GBM":
         raise ValueError("The exercise-grid study is currently limited to GBM")
-    seeds = derive_replication_seeds(base_seed, replications)
+    # Both sides use the grid's own step count -- a policy can only be evaluated on
+    # paths sharing its exercise dates -- with path count pinned at the current
+    # setting so only the exercise-grid effect varies.
+    seed_pairs = derive_paired_seeds(base_seed, replications)
     binomial_reference = crr_american_put_price(contract, market)
     points = tuple(
         _run_point(
@@ -283,18 +306,21 @@ def run_exercise_grid_study(
             market=market,
             model=model,
             heston_inputs=heston_inputs,
-            path_count=config.n_paths,
+            training_path_count=config.n_paths,
+            validation_path_count=config.n_paths,
             time_steps=time_steps,
             basis_terms=config.basis_terms,
-            seeds=seeds,
-            pricing_function=pricing_function,
+            seed_pairs=seed_pairs,
+            fit_policy_function=fit_policy_function,
+            generate_paths_function=generate_paths_function,
+            evaluate_function=evaluate_function,
             binomial_reference=binomial_reference,
         )
         for time_steps in make_exercise_grid(config.n_steps)
     )
     return ExerciseGridStudyResult(
         base_seed,
-        seeds,
+        seed_pairs,
         points,
         contract,
         market,
@@ -314,9 +340,13 @@ def run_basis_sensitivity_study(
     heston_inputs: HestonInputs | None,
     base_seed: int,
     replications: int,
-    pricing_function: PricingFunction = price_put,
+    fit_policy_function=fit_lsmc_policy,
+    generate_paths_function=generate_paths,
+    evaluate_function=evaluate_independent_policy,
 ) -> BasisSensitivityStudyResult:
-    seeds = derive_replication_seeds(base_seed, replications)
+    # Path count and step count are pinned at the current setting; only the basis
+    # specification varies, on both the training and validation side.
+    seed_pairs = derive_paired_seeds(base_seed, replications)
     specifications = basis_specifications(model, config.basis_terms)
     binomial_reference = crr_american_put_price(contract, market) if model == "GBM" else None
     points = tuple(
@@ -327,18 +357,21 @@ def run_basis_sensitivity_study(
             market=market,
             model=model,
             heston_inputs=heston_inputs,
-            path_count=config.n_paths,
+            training_path_count=config.n_paths,
+            validation_path_count=config.n_paths,
             time_steps=config.n_steps,
             basis_terms=terms,
-            seeds=seeds,
-            pricing_function=pricing_function,
+            seed_pairs=seed_pairs,
+            fit_policy_function=fit_policy_function,
+            generate_paths_function=generate_paths_function,
+            evaluate_function=evaluate_function,
             binomial_reference=binomial_reference,
         )
         for terms in specifications
     )
     return BasisSensitivityStudyResult(
         base_seed,
-        seeds,
+        seed_pairs,
         points,
         contract,
         market,
@@ -408,15 +441,20 @@ def crr_convergence_table(
 
 
 def estimate_workload(config: SimulationConfig, model: str, replications: int) -> tuple[int, int]:
-    """Return (pricing runs, simulated path-steps) without executing a study."""
+    """Return (pricing runs, simulated path-steps) without executing a study.
+
+    Each replication now runs two simulations -- a training fit and an independent
+    out-of-sample evaluation -- instead of one same-sample pricing run, roughly
+    doubling the workload of the previous same-sample design.
+    """
     path_grid = make_path_count_grid(config.n_paths)
     exercise_grid = make_exercise_grid(config.n_steps) if model == "GBM" else ()
     specifications = basis_specifications(model, config.basis_terms)
-    runs = replications * (len(path_grid) + len(exercise_grid) + len(specifications))
+    runs = 2 * replications * (len(path_grid) + len(exercise_grid) + len(specifications))
     path_steps = replications * (
-        config.n_steps * sum(path_grid)
-        + config.n_paths * sum(exercise_grid)
-        + len(specifications) * config.n_paths * config.n_steps
+        config.n_steps * (sum(path_grid) + len(path_grid) * config.n_paths)
+        + 2 * config.n_paths * sum(exercise_grid)
+        + 2 * len(specifications) * config.n_paths * config.n_steps
     )
     return runs, path_steps
 
@@ -429,7 +467,8 @@ def studies_to_csv(studies: NumericalStudiesResult) -> str:
         "setting_value",
         "basis_terms",
         "base_seed",
-        "replication_seed",
+        "training_seed",
+        "valuation_seed",
         "estimated_value",
         "reported_standard_error",
         "spot",
@@ -476,7 +515,8 @@ def studies_to_csv(studies: NumericalStudiesResult) -> str:
                         "setting_value": point.setting_value,
                         "basis_terms": ", ".join(point.basis_terms),
                         "base_seed": study.base_seed,
-                        "replication_seed": run.seed,
+                        "training_seed": run.training_seed,
+                        "valuation_seed": run.valuation_seed,
                         "estimated_value": run.estimated_price,
                         "reported_standard_error": run.standard_error,
                         "spot": study.market.spot,

@@ -114,6 +114,34 @@ def test_app_starts_and_generates_manual_result():
     assert len(studies.path_count.derived_seeds) == 3
     assert studies.exercise_grid is not None
 
+    # Numerical validation: paired same-sample vs independent replication study.
+    next(
+        widget
+        for widget in app.number_input
+        if widget.label == "Number of paired replications"
+    ).set_value(3)
+    app.run(timeout=30)
+    assert not app.exception
+    validation_table = next(
+        df.value
+        for df in app.dataframe
+        if "Validation measure" in df.value.columns
+    )
+    assert list(validation_table["Validation measure"]) == [
+        "Continuous-exercise CRR",
+        "Matched-grid CRR",
+        "Mean same-sample LSMC",
+        "Same-sample empirical SD",
+        "Mean independent policy value",
+        "Independent empirical SD",
+        "Mean paired gap",
+        "Independent mean error against matched CRR",
+        "Independent RMSE against matched CRR",
+    ]
+    download_labels = {button.label for button in app.get("download_button")}
+    assert "Download numerical validation (CSV)" in download_labels
+    assert "Download numerical validation charts (PDF)" in download_labels
+
     next(widget for widget in app.selectbox if widget.label == "Asset-price model").select(
         "Heston"
     )
@@ -128,3 +156,9 @@ def test_app_starts_and_generates_manual_result():
     result, _inputs = app.session_state["pricing_output"]
     assert result.model_name == "Heston"
     assert result.displayed_variance_paths is not None
+    assert result.fitted_policy is not None
+    assert any(
+        "Numerical validation is available for American exercise under the GBM"
+        in info.value
+        for info in app.info
+    )

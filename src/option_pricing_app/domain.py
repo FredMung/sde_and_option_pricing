@@ -1,9 +1,15 @@
 """Validated inputs and outputs shared by the standalone application."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from option_pricing_app.lsmc_policy import FittedLSMCPolicy
 
 
 class ExerciseStyle(str, Enum):
@@ -149,6 +155,7 @@ class PricingResult:
     convergence_upper: np.ndarray
     exercise_percentages: np.ndarray | None
     continuation_diagnostics: tuple[LSMCContinuationDiagnostic, ...] | None
+    fitted_policy: FittedLSMCPolicy | None
 
 
 def _positive(name: str, value: float) -> None:

@@ -14,11 +14,8 @@ from option_pricing_app.domain import (
     PutContract,
     SimulationConfig,
 )
-from option_pricing_app.stats import (
-    GBMPriceSimulator,
-    HestonPriceSimulator,
-    LSMCPriceSimulator,
-)
+from option_pricing_app.lsmc_policy import generate_paths, wrap_fitted_policy
+from option_pricing_app.stats import LSMCPriceSimulator
 
 CONTINUATION_GRID_SIZE = 300
 # The exercise-boundary crossing test is only evaluated over this central percentile
@@ -36,14 +33,6 @@ CONTINUATION_GRID_SIZE = 300
 BOUNDARY_GRID_PERCENTILES = (5.0, 95.0)
 
 
-def create_asset_path_simulator(model: str):
-    if model == "GBM":
-        return GBMPriceSimulator()
-    if model == "Heston":
-        return HestonPriceSimulator()
-    raise ValueError(f"Unsupported asset model: {model}")
-
-
 def price_put(
     contract: PutContract,
     market: MarketInputs,
@@ -53,37 +42,11 @@ def price_put(
     heston_inputs: HestonInputs | None = None,
 ) -> PricingResult:
     """Run the original algorithms and prepare their output for the dashboard."""
-    simulator = create_asset_path_simulator(model)
-    if config.seed is not None:
-        np.random.seed(config.seed)
     if model == "GBM":
         unsupported_terms = set(config.basis_terms) - set(PRICE_BASIS_TERMS)
         if unsupported_terms:
             raise ValueError("Variance basis terms are only available with the Heston model")
-        paths = simulator.generate_price_paths(
-            market.spot,
-            contract.maturity,
-            market.risk_free_rate,
-            market.volatility,
-            config.n_paths,
-            config.n_steps,
-        )
-        variance_paths = None
-    else:
-        if heston_inputs is None:
-            raise ValueError("Heston parameters are required for the Heston model")
-        paths, variance_paths = simulator.generate_price_paths(
-            market.spot,
-            contract.maturity,
-            market.risk_free_rate,
-            heston_inputs.mean_reversion_speed,
-            heston_inputs.long_run_variance,
-            heston_inputs.volatility_of_variance,
-            heston_inputs.correlation,
-            heston_inputs.initial_variance,
-            config.n_paths,
-            config.n_steps,
-        )
+    paths, variance_paths = generate_paths(contract, market, config, model, heston_inputs)
     european_pathwise_values = np.exp(
         -market.risk_free_rate * contract.maturity
     ) * np.maximum(contract.strike - paths[-1], 0.0)
@@ -96,6 +59,7 @@ def price_put(
     )
 
     lsmc = None
+    fitted_policy = None
     if exercise_style is ExerciseStyle.EUROPEAN:
         pathwise_values = european_pathwise_values
         price = european_mc_price
@@ -103,15 +67,19 @@ def price_put(
         exercise_percentages = None
         method = "Terminal-payoff Monte Carlo"
     elif exercise_style is ExerciseStyle.AMERICAN:
-        lsmc = LSMCPriceSimulator(simulator)
+        lsmc = LSMCPriceSimulator()
+        dt = contract.maturity / config.n_steps
         price, standard_error = lsmc.backward_induction(
             paths,
             contract.strike,
             market.risk_free_rate,
-            contract.maturity / config.n_steps,
+            dt,
             config.basis_terms,
             variance_paths,
         )
+        # Freezes the regressions already fitted above -- no extra simulation or fit --
+        # so the dashboard can evaluate this exact policy out-of-sample later.
+        fitted_policy = wrap_fitted_policy(lsmc, contract, market, config, dt, price, standard_error)
         pathwise_values = lsmc.option_value_paths[0].copy()
         exercise_counts = np.bincount(
             lsmc.exercise_steps[lsmc.exercise_steps >= 0], minlength=config.n_steps + 1
@@ -186,6 +154,7 @@ def price_put(
         convergence_upper=convergence_high,
         exercise_percentages=exercise_percentages,
         continuation_diagnostics=continuation_diagnostics,
+        fitted_policy=fitted_policy,
     )
 
 

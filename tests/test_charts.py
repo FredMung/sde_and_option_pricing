@@ -9,13 +9,17 @@ from option_pricing_app import (
     price_put,
 )
 from option_pricing_app.app.charts import (
+    BINOMIAL_GREEN,
     PRIMARY_BLUE,
     REFERENCE_RED,
     exercise_boundary_figure,
+    exercise_figure,
     exercise_vs_continuation_figure,
+    paired_replication_figure,
     path_count_study_figure,
 )
 from option_pricing_app.numerical_studies import run_path_count_study
+from option_pricing_app.policy_validation import run_paired_validation_study
 
 
 @pytest.fixture
@@ -99,8 +103,17 @@ def test_cumulative_chart_is_not_labelled_as_path_count_convergence(american_res
 
 
 def test_path_count_study_chart_uses_empirical_replication_label():
-    def fake_pricer(contract, market, config, style, model, heston_inputs):
-        return type("Result", (), {"price": config.n_paths / 100, "standard_error": 0.1})()
+    def fake_fit_policy(contract, market, config, model, heston_inputs):
+        return object()
+
+    def fake_generate_paths(contract, market, config, model, heston_inputs):
+        return config, None
+
+    def fake_evaluate(policy, paths, variance_paths):
+        config = paths
+        return type(
+            "Evaluation", (), {"mean_estimate": config.n_paths / 100, "standard_error": 0.1}
+        )()
 
     study = run_path_count_study(
         PutContract(100, 1),
@@ -110,12 +123,38 @@ def test_path_count_study_chart_uses_empirical_replication_label():
         None,
         42,
         3,
-        fake_pricer,
+        fake_fit_policy,
+        fake_generate_paths,
+        fake_evaluate,
     )
     figure = path_count_study_figure(study)
-    assert figure.layout.title.text == "Path-count convergence study"
+    assert figure.layout.title.text == "Path-count convergence study (out-of-sample)"
     assert figure.layout.height == 430
     assert any(
         trace.name == "95% empirical replication interval" for trace in figure.data
     )
     assert any(trace.name == "Selected path count" for trace in figure.data)
+
+
+def test_exercise_figure_reports_out_of_sample_stopping_statistics():
+    time_grid = np.linspace(0.0, 1.0, 6)
+    exercise_percentages = np.array([0.0, 5.0, 10.0, 15.0, 20.0, 50.0])
+    figure = exercise_figure(time_grid, exercise_percentages, 12.5)
+    assert figure.layout.title.text == "LSMC stopping policy by exercise time (out-of-sample)"
+    assert "Out-of-the-money at maturity: 12.5% of paths" in figure.layout.annotations[0].text
+    assert np.array_equal(figure.data[0].y, exercise_percentages)
+
+
+def test_paired_replication_figure_has_two_markers_per_replication_and_matched_grid_line():
+    contract = PutContract(100, 1)
+    market = MarketInputs(100, 0.2, 0.05)
+    config = SimulationConfig(200, 8, 42, 1)
+    study = run_paired_validation_study(contract, market, config, base_seed=123, replications=3)
+    figure = paired_replication_figure(study)
+    same_sample_trace = next(trace for trace in figure.data if trace.name == "Same-sample estimate")
+    independent_trace = next(
+        trace for trace in figure.data if trace.name == "Independent (out-of-sample) estimate"
+    )
+    assert len(same_sample_trace.x) == 3
+    assert len(independent_trace.x) == 3
+    assert any(shape.line.color == BINOMIAL_GREEN for shape in figure.layout.shapes)

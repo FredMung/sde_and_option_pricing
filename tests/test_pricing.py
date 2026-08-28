@@ -91,9 +91,13 @@ def test_service_prices_both_exercise_styles(style):
             diagnostic.price_grid.shape == (300,)
             for diagnostic in result.continuation_diagnostics
         )
+        assert result.fitted_policy is not None
+        assert result.fitted_policy.same_sample_price == pytest.approx(result.price)
+        assert result.fitted_policy.n_steps == 25
     else:
         assert result.exercise_percentages is None
         assert result.continuation_diagnostics is None
+        assert result.fitted_policy is None
 
 
 def test_lsmc_handles_no_in_the_money_paths():

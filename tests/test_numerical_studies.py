@@ -9,7 +9,6 @@ from option_pricing_app.domain import MarketInputs, PutContract, SimulationConfi
 from option_pricing_app.numerical_studies import (
     NumericalStudiesResult,
     basis_specifications,
-    derive_replication_seeds,
     make_exercise_grid,
     make_path_count_grid,
     run_basis_sensitivity_study,
@@ -23,21 +22,32 @@ CONTRACT = PutContract(100, 1)
 MARKET = MarketInputs(100, 0.2, 0.05)
 
 
-def _fake_pricer(calls):
-    def price(contract, market, config, style, model, heston_inputs):
-        calls.append((contract, market, config, style, model, heston_inputs))
+def _fake_functions():
+    """Fakes for the fit/generate/evaluate seams that avoid real Monte Carlo.
+
+    ``generate_paths`` smuggles the validation ``SimulationConfig`` through as the
+    "paths" return value, which ``evaluate`` reads back -- this keeps orchestration
+    tests fast while still letting them assert on exactly which config each seam saw.
+    """
+    fit_calls = []
+    generate_calls = []
+    evaluate_calls = []
+
+    def fit_policy(contract, market, config, model, heston_inputs):
+        fit_calls.append((contract, market, config, model, heston_inputs))
+        return SimpleNamespace(training_config=config)
+
+    def generate_paths(contract, market, config, model, heston_inputs):
+        generate_calls.append((contract, market, config, model, heston_inputs))
+        return config, None
+
+    def evaluate(policy, paths, variance_paths):
+        config = paths
+        evaluate_calls.append((policy, config))
         estimate = config.n_paths / 1_000 + config.n_steps / 100 + config.seed % 17 / 100
-        return SimpleNamespace(price=estimate, standard_error=0.123)
+        return SimpleNamespace(mean_estimate=estimate, standard_error=0.123)
 
-    return price
-
-
-def test_replication_seeds_are_deterministic_unique_seedsequence_children():
-    first = derive_replication_seeds(42, 5)
-    second = derive_replication_seeds(42, 5)
-    assert first == second
-    assert len(set(first)) == 5
-    assert first != tuple(42 + index for index in range(5))
+    return fit_policy, generate_paths, evaluate, fit_calls, generate_calls, evaluate_calls
 
 
 @pytest.mark.parametrize(
@@ -66,19 +76,26 @@ def test_dynamic_exercise_grid_includes_exact_maximum(maximum, expected):
     assert make_exercise_grid(maximum) == expected
 
 
-def test_path_count_study_reruns_complete_pricer_for_every_setting_and_seed():
-    calls = []
+def test_path_count_study_trains_on_the_setting_and_validates_on_a_fixed_set():
+    fit_policy, generate_paths, evaluate, fit_calls, generate_calls, _ = _fake_functions()
     config = SimulationConfig(500, 10, 42, 1, ("1", "S"))
     study = run_path_count_study(
-        CONTRACT, MARKET, config, "GBM", None, 73, 3, _fake_pricer(calls)
+        CONTRACT, MARKET, config, "GBM", None, 73, 3, fit_policy, generate_paths, evaluate
     )
-    assert len(calls) == len(make_path_count_grid(500)) * 3
-    assert {call[2].n_paths for call in calls} == set(make_path_count_grid(500))
-    for path_count in make_path_count_grid(500):
-        assert [call[2].seed for call in calls if call[2].n_paths == path_count] == list(
-            study.derived_seeds
-        )
-    assert all(call[2].basis_terms == ("1", "S") for call in calls)
+    grid = make_path_count_grid(500)
+    assert len(fit_calls) == len(grid) * 3
+    assert len(generate_calls) == len(grid) * 3
+    # Training path count is the setting under test...
+    assert {call[2].n_paths for call in fit_calls} == set(grid)
+    # ...but the independent validation set is always the currently selected count,
+    # so validation noise cannot be mistaken for a training-size effect.
+    assert {call[2].n_paths for call in generate_calls} == {500}
+    for path_count in grid:
+        assert [call[2].seed for call in fit_calls if call[2].n_paths == path_count] == [
+            pair[0] for pair in study.derived_seeds
+        ]
+    assert all(call[2].basis_terms == ("1", "S") for call in fit_calls)
+    assert all(call[2].basis_terms == ("1", "S") for call in generate_calls)
 
 
 def test_different_path_counts_fit_different_lsmc_policies():
@@ -96,7 +113,7 @@ def test_different_path_counts_fit_different_lsmc_policies():
 
 
 def test_repeated_estimates_use_sample_std_and_empirical_quantiles():
-    calls = []
+    fit_policy, generate_paths, evaluate, *_ = _fake_functions()
     study = run_path_count_study(
         CONTRACT,
         MARKET,
@@ -105,7 +122,9 @@ def test_repeated_estimates_use_sample_std_and_empirical_quantiles():
         None,
         99,
         5,
-        _fake_pricer(calls),
+        fit_policy,
+        generate_paths,
+        evaluate,
     )
     point = study.points[0]
     estimates = np.array([run.estimated_price for run in point.runs])
@@ -116,30 +135,38 @@ def test_repeated_estimates_use_sample_std_and_empirical_quantiles():
 
 
 def test_exercise_grid_orchestration_holds_paths_and_basis_fixed():
-    calls = []
+    fit_policy, generate_paths, evaluate, fit_calls, generate_calls, _ = _fake_functions()
     config = SimulationConfig(100, 25, 42, 1, ("1", "S"))
     study = run_exercise_grid_study(
-        CONTRACT, MARKET, config, "GBM", None, 42, 3, _fake_pricer(calls)
+        CONTRACT, MARKET, config, "GBM", None, 42, 3, fit_policy, generate_paths, evaluate
     )
-    assert {call[2].n_steps for call in calls} == set(make_exercise_grid(25))
-    assert all(call[2].n_paths == 100 for call in calls)
-    assert all(call[2].basis_terms == ("1", "S") for call in calls)
-    assert len(calls) == len(study.points) * 3
+    grid = make_exercise_grid(25)
+    # Both sides share the grid's own step count -- a policy can only be evaluated
+    # against paths sharing its exercise dates.
+    assert {call[2].n_steps for call in fit_calls} == set(grid)
+    assert {call[2].n_steps for call in generate_calls} == set(grid)
+    assert all(call[2].n_paths == 100 for call in fit_calls)
+    assert all(call[2].n_paths == 100 for call in generate_calls)
+    assert all(call[2].basis_terms == ("1", "S") for call in fit_calls)
+    assert len(fit_calls) == len(study.points) * 3
+    assert len(generate_calls) == len(study.points) * 3
 
 
 def test_basis_orchestration_holds_paths_and_steps_fixed_and_includes_selection():
-    calls = []
+    fit_policy, generate_paths, evaluate, fit_calls, generate_calls, _ = _fake_functions()
     selected = ("1", "S²")
     config = SimulationConfig(100, 10, 42, 1, selected)
     study = run_basis_sensitivity_study(
-        CONTRACT, MARKET, config, "GBM", None, 42, 3, _fake_pricer(calls)
+        CONTRACT, MARKET, config, "GBM", None, 42, 3, fit_policy, generate_paths, evaluate
     )
     assert selected in basis_specifications("GBM", selected)
-    assert {call[2].basis_terms for call in calls} == set(
+    assert {call[2].basis_terms for call in fit_calls} == set(basis_specifications("GBM", selected))
+    assert {call[2].basis_terms for call in generate_calls} == set(
         basis_specifications("GBM", selected)
     )
-    assert all(call[2].n_paths == 100 and call[2].n_steps == 10 for call in calls)
-    assert len(calls) == len(study.points) * 3
+    assert all(call[2].n_paths == 100 and call[2].n_steps == 10 for call in fit_calls)
+    assert all(call[2].n_paths == 100 and call[2].n_steps == 10 for call in generate_calls)
+    assert len(fit_calls) == len(study.points) * 3
 
 
 def test_heston_uses_documented_nested_basis_set_and_disables_grid_study():
@@ -156,25 +183,26 @@ def test_heston_uses_documented_nested_basis_set_and_disables_grid_study():
             None,
             42,
             3,
-            _fake_pricer([]),
         )
 
 
 def test_csv_contains_run_level_reproducibility_and_input_metadata():
+    fit_policy, generate_paths, evaluate, *_ = _fake_functions()
     config = SimulationConfig(100, 5, 42, 1)
     path = run_path_count_study(
-        CONTRACT, MARKET, config, "GBM", None, 42, 3, _fake_pricer([])
+        CONTRACT, MARKET, config, "GBM", None, 42, 3, fit_policy, generate_paths, evaluate
     )
     exercise = run_exercise_grid_study(
-        CONTRACT, MARKET, config, "GBM", None, 42, 3, _fake_pricer([])
+        CONTRACT, MARKET, config, "GBM", None, 42, 3, fit_policy, generate_paths, evaluate
     )
     basis = run_basis_sensitivity_study(
-        CONTRACT, MARKET, config, "GBM", None, 42, 3, _fake_pricer([])
+        CONTRACT, MARKET, config, "GBM", None, 42, 3, fit_policy, generate_paths, evaluate
     )
     csv_text = studies_to_csv(NumericalStudiesResult(path, exercise, basis))
     header, first_row, *_ = csv_text.splitlines()
     assert "study_type" in header
-    assert "replication_seed" in header
+    assert "training_seed" in header
+    assert "valuation_seed" in header
     assert "reported_standard_error" in header
     assert "path_count" in header
     assert "time_step_count" in header

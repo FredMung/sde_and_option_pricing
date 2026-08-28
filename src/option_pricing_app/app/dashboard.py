@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -13,6 +14,7 @@ from option_pricing_app.app.charts import (
     exercise_boundary_figure,
     exercise_figure,
     exercise_grid_study_figure,
+    paired_replication_figure,
     path_count_study_figure,
     paths_figure,
     payoff_figure,
@@ -22,6 +24,7 @@ from option_pricing_app.app.charts import (
 from option_pricing_app.app.static_export import (
     early_exercise_policy_pdf,
     numerical_studies_pdf,
+    paired_validation_pdf,
 )
 from option_pricing_app.domain import (
     HESTON_BASIS_TERMS,
@@ -34,15 +37,10 @@ from option_pricing_app.domain import (
     SimulationConfig,
 )
 from option_pricing_app.early_exercise import (
-    VALIDATION_MATURITY_MULTIPLIERS,
-    VALIDATION_MONEYNESS_GRID,
-    VALIDATION_VOLATILITY_MULTIPLIERS,
-    ValidationRow,
     build_early_exercise_policy_table,
     early_exercise_policy_to_csv,
-    run_numerical_validation_study,
-    validation_study_to_csv,
 )
+from option_pricing_app.lsmc_policy import evaluate_independent_policy, generate_paths
 from option_pricing_app.market_data import (
     MarketDataError,
     OptionChain,
@@ -54,12 +52,19 @@ from option_pricing_app.market_data import (
 from option_pricing_app.numerical_studies import (
     NumericalStudiesResult,
     crr_convergence_table,
+    derive_validation_seed,
     estimate_workload,
     generate_base_seed,
     make_exercise_grid,
     make_path_count_grid,
     run_numerical_studies,
     studies_to_csv,
+)
+from option_pricing_app.policy_validation import (
+    PAIRED_VALIDATION_BASE_SEED,
+    PairedValidationStudyResult,
+    paired_validation_to_csv,
+    run_paired_validation_study,
 )
 from option_pricing_app.service import CRR_BINOMIAL_STEPS, price_put
 
@@ -71,7 +76,12 @@ DISCLAIMER = (
 MANUAL_MATURITY = "Manual maturity"
 MIN_PLAUSIBLE_IMPLIED_VOLATILITY = 0.05
 MAX_PLAUSIBLE_IMPLIED_VOLATILITY = 3.00
-MAX_HOSTED_STUDY_PATH_STEPS = 100_000_000
+MAX_HOSTED_STUDY_PATH_STEPS = 200_000_000
+# Raised from the original 100M once each replication started requiring a second,
+# independently simulated validation path set on top of the training set (see
+# lsmc_policy.py) -- out-of-sample evaluation roughly doubled the per-replication
+# cost. 200M covers, e.g., 20 replications at 10,000 paths / 50 steps (GBM, the
+# default 3-term basis), which needs ~185M path-steps.
 DEFAULT_STUDY_REPLICATIONS = 20
 # Chosen so a full numerical-studies run (path-count, exercise-grid where
 # applicable, and basis sensitivity) at DEFAULT_STUDY_REPLICATIONS stays comfortably
@@ -148,14 +158,15 @@ def cached_numerical_studies(
 
 
 @st.cache_data(show_spinner=False)
-def cached_numerical_validation(
+def cached_paired_validation(
     contract: PutContract,
     market: MarketInputs,
     config: SimulationConfig,
     base_seed: int,
-) -> tuple[ValidationRow, ...]:
-    """Cache the Table-1-style parameter-sweep validation for an identical spec."""
-    return run_numerical_validation_study(contract, market, config, base_seed)
+    replications: int,
+) -> PairedValidationStudyResult:
+    """Cache the paired same-sample/independent replication study for an identical spec."""
+    return run_paired_validation_study(contract, market, config, base_seed, replications)
 
 
 def run_dashboard() -> None:
@@ -762,9 +773,12 @@ def _supplementary_results(result: PricingResult, inputs: DashboardInputs) -> No
 def _early_exercise_policy(result: PricingResult, inputs: DashboardInputs) -> None:
     """Render the fitted stopping policy, its boundary, and the early-exercise value.
 
-    Structured after Longstaff & Schwartz (2001), Table 1: the American value, the
-    European value and their difference (the early exercise value) are reported side
-    by side for an independent reference and for the LSMC simulation.
+    The stopping-frequency chart and the early-exercise-value table both report
+    out-of-sample statistics: the training run's frozen policy (``result.fitted_
+    policy``), evaluated without refitting on an independently simulated validation
+    path set. The exercise-boundary chart is the deliberate exception -- it stays
+    in-sample, since it is literally a picture of the training continuation
+    regressions, not a statistic to validate out-of-sample.
     """
     st.divider()
     st.subheader("Early-Exercise Policy")
@@ -777,13 +791,37 @@ def _early_exercise_policy(result: PricingResult, inputs: DashboardInputs) -> No
         "early-exercise feature is estimated to add."
     )
 
-    st.plotly_chart(exercise_figure(result), use_container_width=True)
+    base_seed = st.session_state.get("numerical_studies_base_seed")
+    if base_seed is None:
+        base_seed = generate_base_seed()
+        st.session_state["numerical_studies_base_seed"] = base_seed
+    validation_seed = derive_validation_seed(base_seed)
+
+    policy = result.fitted_policy
+    validation_config = SimulationConfig(
+        inputs.simulation.n_paths, policy.n_steps, validation_seed, 1, policy.basis_terms
+    )
+    validation_paths, validation_variance_paths = generate_paths(
+        inputs.contract, inputs.market, validation_config, inputs.model, inputs.heston_inputs
+    )
+    evaluation = evaluate_independent_policy(policy, validation_paths, validation_variance_paths)
+    exercise_counts = np.bincount(
+        evaluation.exercise_steps[evaluation.exercise_steps >= 0], minlength=policy.n_steps + 1
+    )
+    exercise_percentages = 100.0 * exercise_counts / inputs.simulation.n_paths
+    out_of_the_money_percentage = 100.0 * float(np.mean(evaluation.exercise_steps == -1))
+
+    st.plotly_chart(
+        exercise_figure(result.time_grid, exercise_percentages, out_of_the_money_percentage),
+        use_container_width=True,
+    )
     st.caption(
-        "Each path is counted once at its earliest selected exercise time; paths "
-        "that expire out of the money are not counted. Being in the money does "
-        "not automatically trigger exercise because continuation may be more "
-        "valuable. These percentages are risk-neutral model estimates, not a "
-        "forecast of how many investors will exercise."
+        "Each independent validation path is counted once at its earliest selected "
+        "exercise time under the frozen fitted policy; paths that expire out of the "
+        "money are not counted. Being in the money does not automatically trigger "
+        "exercise because continuation may be more valuable. These percentages are "
+        "risk-neutral model estimates, not a forecast of how many investors will "
+        "exercise."
     )
     if result.continuation_diagnostics:
         st.plotly_chart(
@@ -791,12 +829,15 @@ def _early_exercise_policy(result: PricingResult, inputs: DashboardInputs) -> No
             use_container_width=True,
         )
         boundary_caption = (
-            "Each point is obtained by solving immediate payoff = fitted continuation "
-            "value on the central 5th-95th percentile of that timestep's in-the-money "
-            "prices; the thinly populated outer tails are excluded because the "
-            "regression is extrapolating rather than interpolating there. A point is "
-            "shown only when there are sufficient in-the-money observations and exactly "
-            "one exercise-to-continuation sign change within that range. Missing "
+            "This boundary is drawn from the training run's fitted continuation "
+            "regressions (in-sample) -- it is a picture of the fitted policy itself, "
+            "not a statistic to validate out-of-sample. Each point is obtained by "
+            "solving immediate payoff = fitted continuation value on the central "
+            "5th-95th percentile of that timestep's in-the-money prices; the thinly "
+            "populated outer tails are excluded because the regression is "
+            "extrapolating rather than interpolating there. A point is shown only "
+            "when there are sufficient in-the-money observations and exactly one "
+            "exercise-to-continuation sign change within that range. Missing "
             "timesteps had too few observations, no in-range crossing, or several "
             "crossings. No boundary is extrapolated beyond the trimmed range or "
             "selected arbitrarily from multiple roots. Gaps are retained between "
@@ -821,7 +862,13 @@ def _early_exercise_policy(result: PricingResult, inputs: DashboardInputs) -> No
     st.markdown("#### Estimated value from early exercise")
     try:
         policy_rows = build_early_exercise_policy_table(
-            result, inputs.contract, inputs.market, inputs.model
+            result,
+            inputs.contract,
+            inputs.market,
+            inputs.model,
+            inputs.simulation,
+            inputs.heston_inputs,
+            validation_seed,
         )
     except (ValueError, FloatingPointError) as exc:
         st.error(f"The early-exercise policy table could not be computed: {exc}")
@@ -845,8 +892,10 @@ def _early_exercise_policy(result: PricingResult, inputs: DashboardInputs) -> No
             "The early exercise value is the American value minus the European value "
             "(Longstaff & Schwartz 2001, Table 1). The reference row uses a CRR "
             f"binomial tree ({CRR_BINOMIAL_STEPS:,} steps) and the closed-form "
-            "Black–Scholes price in place of the paper's finite-difference benchmark. "
-            f"Difference in early exercise value (reference − simulation): {difference:+,.4f}."
+            "Black–Scholes price in place of the paper's finite-difference benchmark; "
+            "the LSMC row is the fitted policy's out-of-sample value (see above), not "
+            "a same-sample estimate. "
+            f"Difference in early exercise value (reference − out-of-sample): {difference:+,.4f}."
         )
     else:
         st.caption(
@@ -864,7 +913,14 @@ def _early_exercise_policy(result: PricingResult, inputs: DashboardInputs) -> No
         use_container_width=True,
     )
     try:
-        policy_pdf_bytes = early_exercise_policy_pdf(result, inputs.contract, policy_rows)
+        policy_pdf_bytes = early_exercise_policy_pdf(
+            result,
+            inputs.contract,
+            policy_rows,
+            result.time_grid,
+            exercise_percentages,
+            out_of_the_money_percentage,
+        )
     except (ValueError, RuntimeError) as exc:
         download_pdf.error(f"The PDF export could not be generated: {exc}")
     else:
@@ -888,7 +944,10 @@ def _numerical_studies(inputs: DashboardInputs) -> None:
     st.caption(
         "This is the key analysis: repeated, fully independent reruns of the "
         "simulation and LSMC fit, used to assess convergence and sensitivity rather "
-        "than to report a single point estimate."
+        "than to report a single point estimate. Each point is the fitted policy's "
+        "out-of-sample value -- evaluated on independently simulated validation "
+        "paths, not the same-sample training price -- so a same-sample reuse "
+        "artifact cannot be mistaken for a genuine sensitivity."
     )
     if inputs.exercise_style is not ExerciseStyle.AMERICAN:
         st.info("Numerical LSMC studies are available when the exercise style is American.")
@@ -901,7 +960,11 @@ def _numerical_studies(inputs: DashboardInputs) -> None:
             max_value=20,
             value=DEFAULT_STUDY_REPLICATIONS,
             step=1,
-            help="Each setting is fully simulated and refitted once per replication seed.",
+            help=(
+                "Each setting is fit on a fresh training path set and evaluated on a "
+                "separate, independently simulated validation path set once per "
+                "replication seed pair."
+            ),
         )
     )
     pricing_runs, path_steps = estimate_workload(
@@ -998,6 +1061,13 @@ def _render_numerical_studies(studies: NumericalStudiesResult) -> None:
             pd.DataFrame(_crr_convergence_rows(crr_points)),
             hide_index=True,
             use_container_width=True,
+            column_config={
+                # Default float formatting rounds both columns to too few decimals
+                # to show this table's point: the price and its step-to-step change
+                # shrink into the 1e-4 to 1e-5 range as steps increase.
+                "CRR price": st.column_config.NumberColumn(format="%.6f"),
+                "Change from previous": st.column_config.NumberColumn(format="%.6f"),
+            },
         )
         st.caption(
             f"The CRR reference used throughout this section is computed at "
@@ -1099,78 +1169,131 @@ def _render_numerical_studies(studies: NumericalStudiesResult) -> None:
 
 
 def _numerical_validation(inputs: DashboardInputs) -> None:
-    """Table-1-style parameter-sweep validation of LSMC American pricing under GBM.
+    """Paired same-sample vs independent replication validation under GBM.
 
-    Mirrors Longstaff & Schwartz (2001), Table 1: the strike and risk-free rate are
-    held fixed while spot, volatility and maturity are swept around the current
-    inputs, comparing LSMC against an independent CRR binomial / closed-form
-    reference at each point.
+    For each replication, fits the LSMC policy on one simulated path set (the
+    training seed) and separately evaluates that frozen policy, without refitting,
+    on an independently simulated path set (the valuation seed) -- Section 4.7's
+    Table 2 design: same-sample vs independent policy value. The independent
+    estimate is interpreted as a valid low estimator of the true price (Glasserman,
+    *Monte Carlo Methods in Financial Engineering*, 2004, Sec. 8.6), not the biased
+    same-sample estimate ordinarily reported. GBM only, since the CRR references
+    assume constant-volatility lognormal dynamics.
     """
     st.divider()
     st.subheader("Numerical validation")
     st.caption(
-        "Validates LSMC American pricing against an independent reference across a "
-        "grid of spot prices, volatilities and maturities anchored to the current "
-        "strike and risk-free rate -- the same design as Longstaff & Schwartz (2001), "
-        "Table 1, with a CRR binomial tree standing in for their finite-difference "
-        "benchmark. GBM only."
+        "Compares the same-sample LSMC estimate (fit and evaluated on the same "
+        "training paths -- biased high, because the stopping rule was chosen to fit "
+        "that exact data) against the frozen policy's independent, out-of-sample "
+        "value (evaluated on separately simulated validation paths), across "
+        "repeated paired replications, alongside a CRR binomial reference restricted "
+        "to the same exercise grid. GBM only."
     )
     if inputs.exercise_style is not ExerciseStyle.AMERICAN or inputs.model != "GBM":
         st.info(
             "Numerical validation is available for American exercise under the GBM "
-            "model, where an independent CRR binomial / closed-form reference exists."
+            "model, where an independent CRR binomial reference exists."
         )
         return
 
-    base_seed = st.session_state.get("numerical_studies_base_seed")
-    if base_seed is None:
-        base_seed = generate_base_seed()
-        st.session_state["numerical_studies_base_seed"] = base_seed
+    replications = int(
+        st.number_input(
+            "Number of paired replications",
+            min_value=3,
+            max_value=20,
+            value=DEFAULT_STUDY_REPLICATIONS,
+            step=1,
+            key="paired_validation_replications",
+            help=(
+                "Each replication derives a training seed and a valuation seed from "
+                f"a fixed base seed ({PAIRED_VALIDATION_BASE_SEED}), so this table "
+                "reproduces identically on every run, independent of the live "
+                "simulation's seed."
+            ),
+        )
+    )
     try:
-        with st.spinner("Running the validation grid..."):
-            validation_rows = cached_numerical_validation(
-                inputs.contract, inputs.market, inputs.simulation, base_seed
+        with st.spinner("Running the paired validation replications..."):
+            study = cached_paired_validation(
+                inputs.contract,
+                inputs.market,
+                inputs.simulation,
+                PAIRED_VALIDATION_BASE_SEED,
+                replications,
             )
     except (ValueError, FloatingPointError) as exc:
         st.error(f"The numerical validation could not be completed: {exc}")
         return
 
-    validation_table = pd.DataFrame(
-        [
-            {
-                "Spot": row.spot,
-                "Volatility": row.volatility,
-                "Maturity (years)": row.maturity,
-                "CRR American": row.crr_american,
-                "Closed-form European": row.closed_form_european,
-                "CRR early exercise value": row.crr_early_exercise_value,
-                "LSMC American": row.lsmc_american,
-                "LSMC (s.e.)": row.lsmc_standard_error,
-                "LSMC early exercise value": row.lsmc_early_exercise_value,
-                "Difference in early exercise value": row.difference_in_early_exercise_value,
-            }
-            for row in validation_rows
-        ]
-    )
-    st.dataframe(validation_table, hide_index=True, use_container_width=True)
-    absolute_differences = validation_table["Difference in early exercise value"].abs()
+    st.plotly_chart(paired_replication_figure(study), use_container_width=True)
     st.caption(
-        f"Spot is swept at {', '.join(f'{m:.0%}' for m in VALIDATION_MONEYNESS_GRID)} "
-        "of the strike; volatility and maturity are each swept at the current value "
-        "and twice that value, for "
-        f"{len(VALIDATION_MONEYNESS_GRID) * len(VALIDATION_VOLATILITY_MULTIPLIERS) * len(VALIDATION_MATURITY_MULTIPLIERS)} "
-        "rows. Each row is a single simulation with its own derived seed, not a "
-        "replication average, so (s.e.) is that one run's Monte Carlo standard "
-        "error. Median |difference in early exercise value|: "
-        f"{absolute_differences.median():.4f}; maximum: {absolute_differences.max():.4f}."
+        "Each pair of markers is joined because both come from the same training and "
+        "valuation seed pair -- the line is not implying a continuous ordering across "
+        "replications."
     )
-    st.download_button(
+
+    summary_rows = [
+        {"Validation measure": "Continuous-exercise CRR", "Value": study.continuous_crr},
+        {"Validation measure": "Matched-grid CRR", "Value": study.matched_grid_crr},
+        {"Validation measure": "Mean same-sample LSMC", "Value": study.mean_same_sample_estimate},
+        {
+            "Validation measure": "Same-sample empirical SD",
+            "Value": study.same_sample_empirical_sd,
+        },
+        {
+            "Validation measure": "Mean independent policy value",
+            "Value": study.mean_independent_estimate,
+        },
+        {
+            "Validation measure": "Independent empirical SD",
+            "Value": study.independent_empirical_sd,
+        },
+        {"Validation measure": "Mean paired gap", "Value": study.mean_paired_difference},
+        {
+            "Validation measure": "Independent mean error against matched CRR",
+            "Value": study.independent_mean_error_vs_matched_crr,
+        },
+        {
+            "Validation measure": "Independent RMSE against matched CRR",
+            "Value": study.independent_rmse_vs_matched_crr,
+        },
+    ]
+    st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+    st.caption(
+        "The mean paired gap (same-sample minus independent) is an in-sample reuse "
+        "gap for this contract and setting, not a formal high-bias estimate: a "
+        "handful of replications shows whether reuse matters here, not a general "
+        f"bias magnitude. Matched-grid CRR restricts exercise to the same "
+        f"{inputs.simulation.n_steps} dates as the LSMC policy; continuous-exercise "
+        f"CRR uses a {CRR_BINOMIAL_STEPS:,}-step tree as a near-continuous-exercise "
+        "reference."
+    )
+
+    download_csv, download_pdf = st.columns(2)
+    download_csv.download_button(
         "Download numerical validation (CSV)",
-        data=validation_study_to_csv(validation_rows),
+        data=paired_validation_to_csv(study),
         file_name="numerical_validation.csv",
         mime="text/csv",
         use_container_width=True,
     )
+    try:
+        validation_pdf_bytes = paired_validation_pdf(study)
+    except (ValueError, RuntimeError) as exc:
+        download_pdf.error(f"The PDF export could not be generated: {exc}")
+    else:
+        download_pdf.download_button(
+            "Download numerical validation charts (PDF)",
+            data=validation_pdf_bytes,
+            file_name="numerical_validation.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+        st.caption(
+            "The PDF is a vector figure regenerated directly from the summary "
+            "statistics above (the same data as the CSV export)."
+        )
 
 
 def _methodology() -> None:
