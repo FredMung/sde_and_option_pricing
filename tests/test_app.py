@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from streamlit.testing.v1 import AppTest
 
 from option_pricing_app.app.dashboard import (
@@ -51,6 +52,9 @@ def test_app_starts_and_generates_manual_result():
     app.run(timeout=30)
     assert not app.exception
     assert [metric.label for metric in app.metric] == [
+        "Spot price",
+        "Strike",
+        "Maturity",
         "Market put value",
         "Manually input volatility",
         "Manually input risk-free rate",
@@ -68,14 +72,17 @@ def test_app_starts_and_generates_manual_result():
     app.run(timeout=30)
     assert not app.exception
     assert [metric.label for metric in app.metric] == [
+        "Spot price",
+        "Strike",
+        "Maturity",
         "Market put value",
         "Manually input volatility",
         "Manually input risk-free rate",
-        "Estimated American put value",
+        "Estimated American put value (out-of-sample)",
         "Estimated European put value",
         "Early-exercise premium (American − European)",
-        "Monte Carlo standard error",
-        "Approximate 95% interval (American put value)",
+        "Monte Carlo standard error (out-of-sample)",
+        "Approximate 95% interval (out-of-sample American put value)",
     ]
     assert (
         next(
@@ -91,6 +98,25 @@ def test_app_starts_and_generates_manual_result():
         if metric.label == "Early-exercise premium (American − European)"
     )
     assert premium_metric.delta.endswith("approx. SE")
+
+    # The headline out-of-sample estimate and the Early-Exercise Policy table's LSMC
+    # row are computed from the same shared independent evaluation, so they must
+    # report the identical number.
+    headline_metric = next(
+        metric
+        for metric in app.metric
+        if metric.label == "Estimated American put value (out-of-sample)"
+    )
+    headline_value = float(headline_metric.value.replace(",", ""))
+    policy_table = next(
+        df.value
+        for df in app.dataframe
+        if {"Method", "American", "Early exercise value"} <= set(df.value.columns)
+    )
+    lsmc_row = policy_table[policy_table["Method"].str.contains("out-of-sample")]
+    assert not lsmc_row.empty
+    # headline_value is parsed from a 4-decimal display string, so allow rounding.
+    assert float(lsmc_row["American"].iloc[0]) == pytest.approx(headline_value, abs=1e-4)
     assert not any(
         widget.label == "Exercise timestep for continuation diagnostic"
         for widget in app.selectbox

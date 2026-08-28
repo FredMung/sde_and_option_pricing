@@ -249,7 +249,7 @@ def cash_flow_figure(result: PricingResult) -> go.Figure:
         line_dash="dash",
         line_color=REFERENCE_RED,
         line_width=3,
-        annotation_text=f"Mean = {result.price:,.4f}",
+        annotation_text=f"Same-sample mean = {result.price:,.4f}",
     )
     figure.add_annotation(
         x=0.99,
@@ -294,7 +294,7 @@ def convergence_figure(result: PricingResult) -> go.Figure:
             line={"width": 0},
             fill="tonexty",
             fillcolor=BLUE_BAND,
-            name="Approximate 95% interval",
+            name="Approximate 95% interval (same-sample)",
             hovertemplate="Paths=%{x:,}<br>Lower=%{y:.4f}<extra></extra>",
         )
     )
@@ -304,7 +304,7 @@ def convergence_figure(result: PricingResult) -> go.Figure:
             y=result.convergence_estimates,
             mode="lines",
             line={"width": 2, "color": PRIMARY_BLUE},
-            name="Cumulative estimate",
+            name="Cumulative estimate (same-sample)",
             hovertemplate="Paths=%{x:,}<br>Estimate=%{y:.4f}<extra></extra>",
         )
     )

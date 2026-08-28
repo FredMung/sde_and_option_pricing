@@ -201,14 +201,40 @@ def run_dashboard() -> None:
     output = st.session_state.get("pricing_output")
     if output:
         result, dashboard_inputs = output
-        _headline_results(result, dashboard_inputs)
+        independent_evaluation = _independent_policy_evaluation(result, dashboard_inputs)
+        _headline_results(result, dashboard_inputs, independent_evaluation)
         _numerical_studies(dashboard_inputs)
-        _early_exercise_policy(result, dashboard_inputs)
+        _early_exercise_policy(result, dashboard_inputs, independent_evaluation)
         _numerical_validation(dashboard_inputs)
         _supplementary_results(result, dashboard_inputs)
     else:
         st.info("Choose assumptions in the sidebar, then generate a simulation.")
     _methodology()
+
+
+def _independent_policy_evaluation(result: PricingResult, inputs: DashboardInputs):
+    """Evaluate the fitted policy on one independent validation path set.
+
+    Computed once per run and shared by the headline metrics and the
+    Early-Exercise Policy section, so both report the same out-of-sample number
+    instead of two independently simulated (and therefore slightly different)
+    ones. Returns ``None`` for European exercise, where there is no fitted policy.
+    """
+    if inputs.exercise_style is not ExerciseStyle.AMERICAN or result.fitted_policy is None:
+        return None
+    base_seed = st.session_state.get("numerical_studies_base_seed")
+    if base_seed is None:
+        base_seed = generate_base_seed()
+        st.session_state["numerical_studies_base_seed"] = base_seed
+    validation_seed = derive_validation_seed(base_seed)
+    policy = result.fitted_policy
+    validation_config = SimulationConfig(
+        inputs.simulation.n_paths, policy.n_steps, validation_seed, 1, policy.basis_terms
+    )
+    validation_paths, validation_variance_paths = generate_paths(
+        inputs.contract, inputs.market, validation_config, inputs.model, inputs.heston_inputs
+    )
+    return evaluate_independent_policy(policy, validation_paths, validation_variance_paths)
 
 
 def _controls() -> DashboardInputs | None:
@@ -592,15 +618,21 @@ def _maturity(expiry: str) -> float:
     return days / 365.25
 
 
-def _headline_results(result: PricingResult, inputs: DashboardInputs) -> None:
+def _headline_results(
+    result: PricingResult,
+    inputs: DashboardInputs,
+    independent_evaluation,
+) -> None:
     st.subheader("Simulation results")
     st.caption("Results reflect the inputs captured when Generate simulation was pressed.")
-    low, high = result.confidence_interval
     market = inputs.market_put_price
     known_facts, separator, simulation_metrics = st.columns([1, 0.04, 1])
 
     with known_facts:
-        st.markdown("#### Known facts")
+        st.markdown("#### Contract & Market")
+        st.metric("Spot price", f"{inputs.market.spot:,.4f}")
+        st.metric("Strike", f"{inputs.contract.strike:,.4f}")
+        st.metric("Maturity", f"{inputs.contract.maturity:.4f} years")
         st.metric(
             "Market put value",
             "N/A" if market is None else f"{market:,.4f}",
@@ -611,21 +643,41 @@ def _headline_results(result: PricingResult, inputs: DashboardInputs) -> None:
     with separator:
         st.markdown(
             '<div style="border-left: 1px solid rgba(128, 128, 128, 0.45); '
-            'height: 25rem; margin: 0 auto;"></div>',
+            'height: 35rem; margin: 0 auto;"></div>',
             unsafe_allow_html=True,
         )
 
     with simulation_metrics:
-        st.markdown("#### Simulation metrics")
+        st.markdown("#### LSMC Estimate")
         if inputs.exercise_style is ExerciseStyle.AMERICAN:
-            st.metric("Estimated American put value", f"{result.price:,.4f}")
+            # independent_evaluation is always populated for American exercise (see
+            # _independent_policy_evaluation); the price/SE shown here are the frozen
+            # policy's out-of-sample estimate, not the same-sample training price,
+            # since the latter is biased high (the stopping rule was chosen to fit
+            # that exact data -- see the Numerical Validation section).
+            price = independent_evaluation.mean_estimate
+            standard_error = independent_evaluation.standard_error
+            st.metric(
+                "Estimated American put value (out-of-sample)",
+                f"{price:,.4f}",
+                delta=f"Same-sample: {result.price:,.4f}",
+                delta_color="off",
+                help=(
+                    "The fitted LSMC stopping policy, evaluated on an independently "
+                    "simulated validation path set rather than its own training "
+                    "paths. The same-sample training price shown in the delta is "
+                    "biased high, because that stopping rule was chosen to maximise "
+                    "value on that exact data; see Numerical Validation below for "
+                    "the full paired comparison across replications."
+                ),
+            )
             st.metric(
                 "Estimated European put value",
                 f"{result.european_mc_price:,.4f}",
             )
-            early_exercise_premium = result.price - result.european_mc_price
+            early_exercise_premium = price - result.european_mc_price
             premium_standard_error = (
-                result.standard_error**2 + result.european_mc_standard_error**2
+                standard_error**2 + result.european_mc_standard_error**2
             ) ** 0.5
             st.metric(
                 "Early-exercise premium (American − European)",
@@ -633,15 +685,15 @@ def _headline_results(result: PricingResult, inputs: DashboardInputs) -> None:
                 delta=f"± {premium_standard_error:,.4f} approx. SE",
                 delta_color="off",
                 help=(
-                    "American minus European Monte Carlo estimate under the same "
-                    "simulated paths: the value the LSMC early-exercise feature adds. "
-                    "The shown standard error treats the two estimates as "
-                    "independent, which is a conservative (wider) approximation "
-                    "since both use the same paths."
+                    "Out-of-sample American minus same-sample European Monte Carlo "
+                    "estimate: the value the LSMC early-exercise feature adds. The "
+                    "shown standard error treats the two estimates as independent."
                 ),
             )
         else:
-            st.metric("Estimated European put value", f"{result.price:,.4f}")
+            price = result.price
+            standard_error = result.standard_error
+            st.metric("Estimated European put value", f"{price:,.4f}")
             if result.european_exact_price is not None:
                 st.metric(
                     "Exact European put value",
@@ -654,21 +706,43 @@ def _headline_results(result: PricingResult, inputs: DashboardInputs) -> None:
                 )
             else:
                 st.metric("Exact European put value", "Not implemented for Heston")
-        st.metric("Monte Carlo standard error", f"{result.standard_error:,.4f}")
-        priced_value_label = (
-            "American put value" if inputs.exercise_style is ExerciseStyle.AMERICAN
-            else "European put value"
-        )
-        st.metric(
-            f"Approximate 95% interval ({priced_value_label})",
-            f"[{low:,.4f}, {high:,.4f}]",
-            help=(
-                f"Normal approximation for the estimated {priced_value_label}: "
+        low = max(0.0, price - 1.96 * standard_error)
+        high = price + 1.96 * standard_error
+        if inputs.exercise_style is ExerciseStyle.AMERICAN:
+            se_label = "Monte Carlo standard error (out-of-sample)"
+            interval_label = "Approximate 95% interval (out-of-sample American put value)"
+            interval_help = (
+                "Normal approximation around the out-of-sample estimate above: "
+                "price ± 1.96 × its Monte Carlo standard error, clipped to be "
+                "non-negative. This reflects one independent evaluation's own "
+                "sampling noise, not the full spread across replications shown in "
+                "Numerical Validation. Not a confidence interval for the market put "
+                "value or for any other metric on this page."
+            )
+        else:
+            se_label = "Monte Carlo standard error"
+            interval_label = "Approximate 95% interval (European put value)"
+            interval_help = (
+                "Normal approximation for the estimated European put value: "
                 "price ± 1.96 × Monte Carlo standard error, clipped to be "
                 "non-negative. Not a confidence interval for the market put value "
                 "or for any other metric on this page."
-            ),
-        )
+            )
+        st.metric(se_label, f"{standard_error:,.4f}")
+        st.metric(interval_label, f"[{low:,.4f}, {high:,.4f}]", help=interval_help)
+        if market is not None:
+            st.metric(
+                "Simulated − Market",
+                f"{price - market:+,.4f}",
+                help=(
+                    "The estimated value above (out-of-sample for American, the "
+                    "Monte Carlo estimate for European) minus the observed market "
+                    "put value. A difference may reflect dividends, "
+                    "volatility-surface effects, model calibration, jumps, "
+                    "liquidity, transaction costs, delayed quotes, or bid-ask "
+                    "effects -- not necessarily a pricing error."
+                ),
+            )
 
 
 def _supplementary_results(result: PricingResult, inputs: DashboardInputs) -> None:
@@ -695,7 +769,9 @@ def _supplementary_results(result: PricingResult, inputs: DashboardInputs) -> No
     else:
         st.caption(
             "The American–European difference is the estimated value added by the "
-            "LSMC early-exercise feature under the same simulated paths."
+            "LSMC early-exercise feature: an out-of-sample American estimate (the "
+            "frozen policy evaluated on independent validation paths) minus the "
+            "same-sample European estimate from this training run."
         )
     st.caption(f"Market reference: {inputs.market_put_price_source}")
     with st.expander("Single-run cumulative estimate", expanded=False):
@@ -770,14 +846,19 @@ def _supplementary_results(result: PricingResult, inputs: DashboardInputs) -> No
     st.dataframe(pd.DataFrame(rows, columns=["Input", "Value or source"]), hide_index=True, use_container_width=True)
 
 
-def _early_exercise_policy(result: PricingResult, inputs: DashboardInputs) -> None:
+def _early_exercise_policy(
+    result: PricingResult,
+    inputs: DashboardInputs,
+    independent_evaluation,
+) -> None:
     """Render the fitted stopping policy, its boundary, and the early-exercise value.
 
     The stopping-frequency chart and the early-exercise-value table both report
-    out-of-sample statistics: the training run's frozen policy (``result.fitted_
-    policy``), evaluated without refitting on an independently simulated validation
-    path set. The exercise-boundary chart is the deliberate exception -- it stays
-    in-sample, since it is literally a picture of the training continuation
+    out-of-sample statistics from ``independent_evaluation`` -- the training run's
+    frozen policy (``result.fitted_policy``), evaluated without refitting on an
+    independently simulated validation path set, computed once and shared with the
+    headline metrics. The exercise-boundary chart is the deliberate exception -- it
+    stays in-sample, since it is literally a picture of the training continuation
     regressions, not a statistic to validate out-of-sample.
     """
     st.divider()
@@ -791,22 +872,10 @@ def _early_exercise_policy(result: PricingResult, inputs: DashboardInputs) -> No
         "early-exercise feature is estimated to add."
     )
 
-    base_seed = st.session_state.get("numerical_studies_base_seed")
-    if base_seed is None:
-        base_seed = generate_base_seed()
-        st.session_state["numerical_studies_base_seed"] = base_seed
-    validation_seed = derive_validation_seed(base_seed)
-
-    policy = result.fitted_policy
-    validation_config = SimulationConfig(
-        inputs.simulation.n_paths, policy.n_steps, validation_seed, 1, policy.basis_terms
-    )
-    validation_paths, validation_variance_paths = generate_paths(
-        inputs.contract, inputs.market, validation_config, inputs.model, inputs.heston_inputs
-    )
-    evaluation = evaluate_independent_policy(policy, validation_paths, validation_variance_paths)
+    evaluation = independent_evaluation
     exercise_counts = np.bincount(
-        evaluation.exercise_steps[evaluation.exercise_steps >= 0], minlength=policy.n_steps + 1
+        evaluation.exercise_steps[evaluation.exercise_steps >= 0],
+        minlength=result.fitted_policy.n_steps + 1,
     )
     exercise_percentages = 100.0 * exercise_counts / inputs.simulation.n_paths
     out_of_the_money_percentage = 100.0 * float(np.mean(evaluation.exercise_steps == -1))
@@ -866,9 +935,7 @@ def _early_exercise_policy(result: PricingResult, inputs: DashboardInputs) -> No
             inputs.contract,
             inputs.market,
             inputs.model,
-            inputs.simulation,
-            inputs.heston_inputs,
-            validation_seed,
+            independent_evaluation,
         )
     except (ValueError, FloatingPointError) as exc:
         st.error(f"The early-exercise policy table could not be computed: {exc}")

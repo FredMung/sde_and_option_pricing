@@ -10,14 +10,8 @@ import csv
 import io
 from dataclasses import dataclass
 
-from option_pricing_app.domain import (
-    HestonInputs,
-    MarketInputs,
-    PricingResult,
-    PutContract,
-    SimulationConfig,
-)
-from option_pricing_app.lsmc_policy import evaluate_independent_policy, generate_paths
+from option_pricing_app.domain import MarketInputs, PricingResult, PutContract
+from option_pricing_app.lsmc_policy import IndependentPolicyEvaluation
 from option_pricing_app.service import black_scholes_put_price, crr_american_put_price
 
 
@@ -35,9 +29,7 @@ def build_early_exercise_policy_table(
     contract: PutContract,
     market: MarketInputs,
     model: str,
-    config: SimulationConfig,
-    heston_inputs: HestonInputs | None,
-    validation_seed: int,
+    independent_evaluation: IndependentPolicyEvaluation | None,
 ) -> tuple[EarlyExercisePolicyRow, ...]:
     """Longstaff & Schwartz (2001), Table 1-style summary for the current run.
 
@@ -48,13 +40,15 @@ def build_early_exercise_policy_table(
     under GBM, since CRR and the closed-form price both assume constant-volatility
     lognormal dynamics.
 
-    The LSMC row is the frozen policy's *out-of-sample* value: the training run's
-    fitted policy, evaluated without refitting on an independently simulated
-    validation path set at ``validation_seed``. This measures what the fitted policy
-    is actually worth on new paths, rather than the same-sample training estimate,
-    which is biased high because the stopping rule was chosen to fit that exact data.
-    The European value has no fitted stopping decision, so it carries no such bias
-    and is left as the training run's same-sample Monte Carlo estimate.
+    The LSMC row is the frozen policy's *out-of-sample* value: ``independent_
+    evaluation`` is the training run's fitted policy evaluated, without refitting,
+    on an independently simulated validation path set -- computed once by the
+    caller and shared with the headline metrics, so both parts of the dashboard
+    report the same number. This measures what the fitted policy is actually
+    worth on new paths, rather than the same-sample training estimate, which is
+    biased high because the stopping rule was chosen to fit that exact data. The
+    European value has no fitted stopping decision, so it carries no such bias and
+    is left as the training run's same-sample Monte Carlo estimate.
     """
     rows: list[EarlyExercisePolicyRow] = []
     if model == "GBM":
@@ -69,24 +63,16 @@ def build_early_exercise_policy_table(
                 early_exercise_value=crr_american - closed_form_european,
             )
         )
-    if result.fitted_policy is not None:
-        policy = result.fitted_policy
-        validation_config = SimulationConfig(
-            config.n_paths, policy.n_steps, validation_seed, 1, policy.basis_terms
-        )
-        validation_paths, validation_variance_paths = generate_paths(
-            contract, market, validation_config, model, heston_inputs
-        )
-        evaluation = evaluate_independent_policy(
-            policy, validation_paths, validation_variance_paths
-        )
+    if independent_evaluation is not None:
         rows.append(
             EarlyExercisePolicyRow(
                 method="LSMC (out-of-sample policy value)",
-                american_value=evaluation.mean_estimate,
-                american_standard_error=evaluation.standard_error,
+                american_value=independent_evaluation.mean_estimate,
+                american_standard_error=independent_evaluation.standard_error,
                 european_value=result.european_mc_price,
-                early_exercise_value=evaluation.mean_estimate - result.european_mc_price,
+                early_exercise_value=(
+                    independent_evaluation.mean_estimate - result.european_mc_price
+                ),
             )
         )
     return tuple(rows)
